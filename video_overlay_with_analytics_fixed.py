@@ -17,7 +17,7 @@ from collections import deque
 import argparse
 
 # MediaPipe server configuration
-SERVER_URL = "http://127.0.0.1:5001"
+SERVER_URL = "https://poseserver.onrender.com"
 TUMBLING_DETECTION_ENABLED = True
 
 # Import the comprehensive ACL risk assessment system
