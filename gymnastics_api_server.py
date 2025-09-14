@@ -20,7 +20,8 @@ CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://loc
      expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"])
 
 # Configuration
-MEDIAPIPE_SERVER_URL = "http://127.0.0.1:5001"
+MEDIAPIPE_SERVER_URL = "https://poseserver.onrender.com"
+
 VIDEO_PROCESSING_DIR = "../output_videos"
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_videos")
 ANALYTICS_DIR = "../analytics"
