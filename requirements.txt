@@ -1,0 +1,64 @@
+# Gymnastics Analytics Backend Requirements
+# Core web framework
+Flask==2.2.3
+Flask-CORS==6.0.1
+
+# Database
+pymongo==4.15.0
+
+# Computer Vision and Machine Learning
+opencv-python==4.10.0.84
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+numpy==1.26.4
+scipy==1.16.1
+
+# Image Processing
+Pillow==10.2.0
+matplotlib==3.9.1
+
+# HTTP Requests
+requests==2.31.0
+
+# Data Processing
+# Note: These are typically included with Python, but listed for completeness
+# json - built-in
+# datetime - built-in
+# os - built-in
+# subprocess - built-in
+# threading - built-in
+# tempfile - built-in
+# shutil - built-in
+# base64 - built-in
+# math - built-in
+# time - built-in
+# typing - built-in (Python 3.5+)
+# urllib.parse - built-in
+# bson - comes with pymongo
+# logging - built-in
+# argparse - built-in
+# collections - built-in
+# pathlib - built-in (Python 3.4+)
+# http.server - built-in
+# socketserver - built-in
+# sys - built-in
+# queue - built-in
+# gc - built-in
+# csv - built-in
+# dataclasses - built-in (Python 3.7+)
+
+# Development and Testing (optional - uncomment if needed)
+# pytest==7.4.3
+# pytest-flask==1.3.0
+
+# Production Server (choose one based on deployment target)
+# gunicorn==21.2.0  # For Linux/macOS production
+# waitress==2.1.2   # For Windows production
+# uwsgi==2.0.23     # Alternative production server
+
+# Environment Management (optional)
+# python-dotenv==1.0.0
+
+# Additional utilities that might be useful
+# psutil==5.9.6     # System monitoring
+# schedule==1.2.0   # Task scheduling
