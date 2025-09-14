@@ -1,24 +1,36 @@
-# Gymnastics Analytics Backend Requirements
+# Gymnastics Analytics Backend Requirements - Python 3.8 Compatible
 # Core web framework
-Flask==2.2.3
-Flask-CORS==6.0.1
+Flask>=2.0.0,<3.0.0
+Flask-CORS>=3.0.0,<4.0.0
 
 # Database
-pymongo==4.15.0
+pymongo>=4.0.0,<5.0.0
 
 # Computer Vision and Machine Learning
-opencv-python==4.10.0.84
-opencv-contrib-python==4.11.0.86
-mediapipe>=0.10.0,<1.0.0
-numpy==1.26.4
-scipy==1.16.1
+opencv-python>=4.5.0,<5.0.0
+# Note: opencv-contrib-python conflicts with opencv-python, use one or the other
+# opencv-contrib-python>=4.5.0,<5.0.0
+
+# MediaPipe - compatible with Python 3.8
+mediapipe>=0.8.0,<1.0.0
+numpy>=1.19.0,<2.0.0
+scipy>=1.7.0,<2.0.0
+
+# Additional dependencies for MediaPipe
+protobuf>=3.17.0,<4.0.0
 
 # Image Processing
-Pillow==10.2.0
-matplotlib==3.9.1
+Pillow>=8.0.0,<11.0.0
+matplotlib>=3.3.0,<4.0.0
 
 # HTTP Requests
-requests==2.31.0
+requests>=2.25.0,<3.0.0
+
+# Production Server
+gunicorn>=20.0.0,<22.0.0
+
+# Environment Management
+python-dotenv>=0.19.0,<2.0.0
 
 # Data Processing
 # Note: These are typically included with Python, but listed for completeness
