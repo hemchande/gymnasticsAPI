@@ -753,7 +753,7 @@ def detect_pose_batch():
 
 
 @app.route('/detect-pose1', methods=['POST'])
-def detect_pose():
+def detect_pose1():
     """Detect pose in single image with coordinate extraction"""
     try:
         data = request.get_json()
