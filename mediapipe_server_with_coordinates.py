@@ -750,6 +750,94 @@ def detect_pose_batch():
         logger.error(f"Error in batch pose detection: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+
+@app.route('/detect-pose1', methods=['POST'])
+def detect_pose():
+    """Detect pose in single image with coordinate extraction"""
+    try:
+        data = request.get_json()
+        image_base64 = data.get('image')
+        event_type = data.get('event_type', 'floor')
+
+        if not image_base64:
+            return jsonify({'error': 'No image provided'}), 400
+
+        # Convert base64 to image
+        t0 = time.time()
+        image = base64_to_image(image_base64)
+        if image is None:
+            return jsonify({'error': 'Invalid image data'}), 400
+        t1 = time.time()
+
+        # Resize to speed up MediaPipe
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_rgb = cv2.resize(image_rgb, (640, 480))   # 🔑 Downscale
+        t2 = time.time()
+
+        # Ensure monotonically increasing timestamps
+        global last_timestamp
+        current_time = time.time()
+        if current_time <= last_timestamp:
+            current_time = last_timestamp + 0.001
+        last_timestamp = current_time
+
+        # Run inference
+        results = pose.process(image_rgb)
+        t3 = time.time()
+
+        landmarks, metrics = [], {}
+        if results.pose_landmarks:
+            for landmark in results.pose_landmarks.landmark:
+                landmarks.append({
+                    'x': landmark.x,
+                    'y': landmark.y,
+                    'z': landmark.z,
+                    'visibility': landmark.visibility
+                })
+
+            metrics = calculate_stakeholder_metrics(landmarks, list(frame_history), event_type)
+
+        # Bounding box
+        coordinates = [calculate_bounding_box_from_landmarks(landmarks)] if landmarks else []
+
+        # Update histories
+        if landmarks:
+            frame_history.append({
+                'landmarks': landmarks,
+                'metrics': metrics,
+                'timestamp': time.time()
+            })
+
+        if metrics:
+            analytics_history.append({
+                'timestamp': time.time(),
+                'metrics': metrics,
+                'event_type': event_type
+            })
+
+        # Timing logs
+        logger.info(f"⏱ Base64 decode: {t1 - t0:.2f}s | Resize: {t2 - t1:.2f}s | Inference: {t3 - t2:.2f}s | Total: {t3 - t0:.2f}s")
+
+        return jsonify({
+            'success': True,
+            'landmarks': landmarks,
+            'metrics': metrics,
+            'coordinates': coordinates,
+            'landmarks_count': len(landmarks),
+            'timing': {
+                'decode': round(t1 - t0, 2),
+                'resize': round(t2 - t1, 2),
+                'inference': round(t3 - t2, 2),
+                'total': round(t3 - t0, 2)
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error in pose detection: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/get-analytics', methods=['GET'])
 def get_analytics():
     """Get latest analytics"""
