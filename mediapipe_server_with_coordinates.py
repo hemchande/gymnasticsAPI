@@ -847,5 +847,7 @@ if __name__ == '__main__':
     if COORDINATE_API_ENABLED:
         coordinate_ok = check_coordinate_api_health()
         print(f"📍 Coordinate API Status: {'✅ Available' if coordinate_ok else '❌ Unavailable'}")
+
+    port = int(os.environ.get("PORT", 5001))
     
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True)
