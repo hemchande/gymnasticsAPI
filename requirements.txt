@@ -9,7 +9,7 @@ pymongo==4.15.0
 # Computer Vision and Machine Learning
 opencv-python==4.10.0.84
 opencv-contrib-python==4.11.0.86
-mediapipe==0.10.21
+mediapipe==0.10.8
 numpy==1.26.4
 scipy==1.16.1
 
