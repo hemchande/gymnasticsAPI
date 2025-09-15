@@ -24,7 +24,7 @@ from bson import ObjectId
 import re
 
 # Import database modules
-from database import db_manager, sessions, users, video_metadata
+from database2 import db_manager, sessions, users, video_metadata
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080"], 
