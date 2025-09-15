@@ -27,7 +27,7 @@ matplotlib>=3.3.0,<4.0.0
 
 # HTTP Requests
 requests>=2.25.0,<3.0.0
-
+gridfs==0.1
 uvicorn[standard]==0.23.2
 
 # Production Server
