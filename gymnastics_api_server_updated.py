@@ -1638,6 +1638,190 @@ def download_per_frame_video():
         print(f"❌ Error downloading per-frame video: {e}")
         return jsonify({"error": "Failed to download per-frame video"}), 500
 
+
+@app.route('/analyzeVideo1', methods=['POST'])
+def analyze_video_from_gridfs():
+    """Analyze video from GridFS by downloading it locally first, then processing"""
+    try:
+        data = request.get_json()
+        video_filename = data.get('video_filename')
+        athlete_name = data.get('athlete_name', 'Unknown Athlete')
+        event = data.get('event', 'Floor Exercise')
+        session_name = data.get('session_name', f'{athlete_name} - {event}')
+        user_id = data.get('user_id', 'demo_user')
+        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
+        
+        if not video_filename:
+            return jsonify({"error": "video_filename is required"}), 400
+        
+        print(f"🔍 Looking for video: {video_filename}")
+        
+        # Check if Railway MediaPipe server is running
+        if not video_processor.check_mediapipe_server():
+            return jsonify({
+                "error": "Railway MediaPipe server is not available",
+                "message": "Please check the Railway MediaPipe server status",
+                "server_url": MEDIAPIPE_SERVER_URL
+            }), 503
+        
+        # First try to find video locally (existing behavior)
+        best_video_path, is_h264, original_path = video_processor.find_best_video(video_filename)
+        
+        if best_video_path and os.path.exists(best_video_path):
+            print(f"✅ Found local video: {best_video_path}")
+            video_path = best_video_path
+        else:
+            # Try to find video in GridFS by filename
+            print(f"🔍 Video not found locally, searching GridFS for: {video_filename}")
+            
+            # Search for video in GridFS
+            gridfs_file = None
+            try:
+                # Try to find by exact filename first
+                gridfs_file = fs.find_one({"filename": video_filename})
+                
+                # If not found, try to find by partial match
+                if not gridfs_file:
+                    base_name = os.path.splitext(video_filename)[0]
+                    for file_doc in fs.find({"filename": {"$regex": base_name, "$options": "i"}}):
+                        if file_doc.filename.endswith('.mp4'):
+                            gridfs_file = file_doc
+                            break
+                
+                if not gridfs_file:
+                    return jsonify({"error": f"Video file not found in GridFS: {video_filename}"}), 404
+                
+                print(f"✅ Found video in GridFS: {gridfs_file.filename}")
+                
+                # Download video from GridFS to temporary local file
+                temp_dir = "/tmp" if os.path.exists("/tmp") else "."
+                temp_filename = f"temp_{int(time.time())}_{gridfs_file.filename}"
+                temp_path = os.path.join(temp_dir, temp_filename)
+                
+                print(f"📥 Downloading video to: {temp_path}")
+                with open(temp_path, 'wb') as temp_file:
+                    temp_file.write(gridfs_file.read())
+                
+                video_path = temp_path
+                print(f"✅ Video downloaded successfully: {os.path.getsize(temp_path)} bytes")
+                
+            except Exception as e:
+                print(f"❌ Error accessing GridFS: {e}")
+                return jsonify({"error": f"Failed to access video in GridFS: {str(e)}"}), 500
+        
+        # Process the video (same as original analyzeVideo)
+        print(f"🎬 Processing video: {os.path.basename(video_path)}")
+        
+        # Generate unique output name
+        timestamp = int(time.time())
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        output_name = f"h264_analyzed_{base_name}_{timestamp}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_name)
+        
+        # Ensure output directory exists
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Process video with analytics
+        print(f"🔄 Processing video with MediaPipe...")
+        success = video_processor.process_video_with_analytics(video_path, output_name)
+        
+        if not success:
+            return jsonify({"error": "Video processing failed"}), 500
+        
+        print(f"✅ Video processing completed: {output_path}")
+        
+        # Upload processed video and analytics to GridFS
+        analytics_filename = f"fixed_analytics_{os.path.basename(video_path)}.json"
+        analytics_path = os.path.join(".", analytics_filename)
+        
+        if not os.path.exists(analytics_path):
+            analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
+        
+        print(f"📤 Uploading processed video and analytics to GridFS...")
+        video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
+            output_path, analytics_path, {
+                "athlete_name": athlete_name,
+                "event": event,
+                "session_name": session_name,
+                "user_id": user_id,
+                "date": date,
+                "original_filename": video_filename,
+                "processed_video_filename": output_name,
+                "processing_timestamp": timestamp
+            }
+        )
+        
+        if not video_id:
+            return jsonify({"error": "Failed to upload processed video to MongoDB"}), 500
+        
+        # Create session record
+        session_data = {
+            "user_id": user_id,
+            "athlete_name": athlete_name,
+            "session_name": session_name,
+            "event": event,
+            "date": date,
+            "duration": "00:00",
+            "original_filename": video_filename,
+            "processed_video_filename": output_name,
+            "processed_video_url": f"http://localhost:5004/downloadVideo/{video_id}",
+            "analytics_filename": analytics_filename if analytics_id else None,
+            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "motion_iq": 0.0,
+            "acl_risk": 0.0,
+            "precision": 0.0,
+            "power": 0.0,
+            "tumbling_percentage": 0.0,
+            "landmark_confidence": 0.0,
+            "total_frames": 0,
+            "fps": 0.0,
+            "highlights": [],
+            "areas_for_improvement": [],
+            "coach_notes": "",
+            "notes": f"Video analyzed with Railway MediaPipe server: {video_filename}",
+            "status": "completed",
+            "processing_progress": 1.0,
+            "processing_status": "completed",
+            "gridfs_video_id": video_id,
+            "gridfs_analytics_id": analytics_id,
+            "is_binary_stored": True,
+            "has_landmarks": True,
+            "created_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        }
+        
+        session_id = sessions.create_session(session_data)
+        print(f"✅ Session created: {session_id}")
+        
+        # Clean up temporary file if it was downloaded from GridFS
+        if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
+            try:
+                os.remove(video_path)
+                print(f"🗑️ Cleaned up temporary file: {video_path}")
+            except Exception as e:
+                print(f"⚠️ Could not clean up temporary file: {e}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Video analysis completed and uploaded to MongoDB",
+            "session_id": str(session_id),
+            "video_id": str(video_id),
+            "analytics_id": str(analytics_id) if analytics_id else None,
+            "output_video": output_name,
+            "analytics_file": analytics_filename if analytics_id else None,
+            "download_url": f"http://localhost:5004/downloadVideo/{video_id}",
+            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in analyzeVideo1: {e}")
+        return jsonify({
+            "error": "Video analysis failed",
+            "details": str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     print("🚀 Starting Gymnastics API Server (Updated with Railway MediaPipe)")
     print("=" * 60)
