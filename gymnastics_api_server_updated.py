@@ -1821,6 +1821,62 @@ def analyze_video_from_gridfs():
             "details": str(e)
         }), 500
 
+@app.route('/getVideo', methods=['GET'])
+def get_video_for_frontend():
+    """Get video for frontend display (simplified, no range requests)"""
+    try:
+        video_filename = request.args.get('video_filename')
+        if not video_filename:
+            return jsonify({"error": "video_filename parameter is required"}), 400
+        
+        # Find session by video filename
+        session = sessions.get_session_by_video_filename(video_filename)
+        if not session:
+            return jsonify({"error": "Video not found"}), 404
+        
+        video_id = session.get('gridfs_video_id')
+        if not video_id:
+            return jsonify({"error": "Video not found in session"}), 404
+        
+        # Get video file info first
+        video_info = video_processor.get_video_info_from_gridfs(video_id)
+        if not video_info:
+            return jsonify({"error": "Failed to retrieve video info from database"}), 500
+        
+        filename = video_info['filename'] or video_filename
+        file_size = video_info['length']
+        content_type = video_info['content_type'] or 'video/mp4'
+        
+        # Stream the entire video without range requests
+        stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
+            video_id, 0, file_size - 1
+        )
+        
+        if stream_generator is None:
+            return jsonify({"error": "Failed to stream video from database"}), 500
+        
+        response = Response(
+            stream_generator,
+            status=200,  # OK
+            mimetype=content_type,
+            headers={
+                'Content-Length': str(file_size),
+                'Content-Disposition': f'inline; filename="{filename}"',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Cache-Control': 'public, max-age=3600'
+            }
+        )
+        
+        return response
+        
+    except Exception as e:
+        print(f"❌ Error getting video for frontend: {e}")
+        return jsonify({
+            "error": "Failed to get video",
+            "details": str(e)
+        }), 500
 
 if __name__ == '__main__':
     print("🚀 Starting Gymnastics API Server (Updated with Railway MediaPipe)")
