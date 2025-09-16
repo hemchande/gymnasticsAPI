@@ -16,18 +16,9 @@ from datetime import datetime
 from collections import deque
 import argparse
 
-# MediaPipe server configuration
-SERVER_URL = "https://poseserver.onrender.com"
+# Configuration
+SERVER_URL = "http://localhost:5001"
 TUMBLING_DETECTION_ENABLED = True
-
-# Import the comprehensive ACL risk assessment system
-try:
-    from gymnastics_api_server import acl_risk_assessor
-    COMPREHENSIVE_ACL_ENABLED = True
-    print("✅ Comprehensive ACL risk assessment system loaded")
-except ImportError:
-    COMPREHENSIVE_ACL_ENABLED = False
-    print("⚠️  Comprehensive ACL system not available, using simple ACL calculation")
 
 class FixedTumblingAnalyzer:
     """Fixed tumbling analyzer with proper elevation calculation"""
@@ -64,10 +55,6 @@ class FixedTumblingAnalyzer:
         self.ground_level = None
         self.ground_calibrated = False
         self.ground_samples = []
-        
-        # Frame history for comprehensive ACL assessment
-        self.frame_history = []
-        self.max_history = 10
         
     def calibrate_ground_level(self, landmarks):
         """Calibrate ground level from ankle positions when person is standing"""
@@ -460,19 +447,10 @@ class FixedTumblingAnalyzer:
         forward_lean = self.calculate_forward_lean_angle(landmarks)
         enhanced_metrics['forward_lean_angle'] = forward_lean
         
-        # Calculate comprehensive ACL risk factors
+        # Calculate ACL risk factors
         acl_risk_factors = self.calculate_acl_risk_factors(landmarks)
         enhanced_metrics['acl_risk_factors'] = acl_risk_factors
         enhanced_metrics['acl_recommendations'] = self.get_acl_risk_recommendations(acl_risk_factors)
-        
-        # Add comprehensive ACL assessment data for overlay
-        if COMPREHENSIVE_ACL_ENABLED and 'coaching_cues' in acl_risk_factors:
-            # The comprehensive ACL data is already included in acl_risk_factors
-            pass
-        else:
-            # Fallback: add basic coaching cues if comprehensive data not available
-            enhanced_metrics['acl_risk_factors']['coaching_cues'] = []
-            enhanced_metrics['acl_risk_factors']['context_factors'] = []
         
         # Improved flight phase detection
         if self.detect_tumbling_start(landmarks, frame_number):
@@ -564,7 +542,7 @@ class FixedTumblingAnalyzer:
         return 0
     
     def calculate_acl_risk_factors(self, landmarks):
-        """Calculate ACL risk factors using comprehensive assessment system"""
+        """Calculate ACL risk factors from landmarks"""
         if not landmarks or len(landmarks) < 33:
             return {
                 'knee_angle_risk': 0,
@@ -574,45 +552,6 @@ class FixedTumblingAnalyzer:
                 'risk_level': 'LOW'
             }
         
-        # Use comprehensive ACL risk assessment if available
-        if COMPREHENSIVE_ACL_ENABLED:
-            try:
-                # Update frame history for temporal analysis
-                self.frame_history.append({
-                    'landmarks': landmarks,
-                    'timestamp': time.time()
-                })
-                
-                # Keep only recent frames
-                if len(self.frame_history) > self.max_history:
-                    self.frame_history.pop(0)
-                
-                # Use comprehensive ACL risk assessment
-                acl_assessment = acl_risk_assessor.assess_acl_risk(
-                    landmarks, 
-                    self.frame_history,
-                    session_context={'session_type': 'practice', 'apparatus': 'floor'}
-                )
-                
-                # Extract risk factors from comprehensive assessment
-                risk_factors = acl_assessment.get('risk_factors', {})
-                
-                return {
-                    'knee_angle_risk': risk_factors.get('knee_flexion', {}).get('risk_score', 0),
-                    'knee_valgus_risk': risk_factors.get('frontal_plane', {}).get('risk_score', 0),
-                    'landing_mechanics_risk': risk_factors.get('landing_mechanics', {}).get('risk_score', 0),
-                    'overall_acl_risk': acl_assessment.get('overall_risk', 0),
-                    'risk_level': acl_assessment.get('risk_level', 'LOW'),
-                    'coaching_cues': acl_assessment.get('coaching_cues', []),
-                    'context_factors': risk_factors.get('context', {}).get('context_factors', [])
-                }
-                
-            except Exception as e:
-                print(f"⚠️  Comprehensive ACL assessment failed: {e}, falling back to simple calculation")
-                # Fall back to simple calculation
-                pass
-        
-        # Fallback to simple ACL risk calculation
         risk_factors = {
             'knee_angle_risk': 0,
             'knee_valgus_risk': 0,
@@ -805,11 +744,60 @@ class FixedVideoOverlayWithAnalytics:
         for idx, color in key_points.items():
             if idx < len(landmarks):
                 landmark = landmarks[idx]
-                if landmark.get('visibility', 0) > 0.5:
+                # Lower visibility threshold to show more landmarks
+                if landmark.get('visibility', 0) > 0.1:
                     x = int(landmark['x'] * self.width)
                     y = int(landmark['y'] * self.height)
-                    cv2.circle(frame, (x, y), 5, color, -1)
-                    cv2.putText(frame, str(idx), (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+                    cv2.circle(frame, (x, y), 6, color, -1)  # Slightly larger circles
+                    cv2.putText(frame, str(idx), (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        # Draw skeleton connections
+        frame = self.draw_skeleton_connections(frame, landmarks)
+        
+        return frame
+    
+    def draw_skeleton_connections(self, frame, landmarks):
+        """Draw skeleton connections between landmarks"""
+        if not landmarks or len(landmarks) < 33:
+            return frame
+            
+        # Define skeleton connections (MediaPipe pose connections)
+        connections = [
+            # Head and shoulders
+            (0, 1), (1, 2), (2, 3), (3, 7),
+            (0, 4), (4, 5), (5, 6), (6, 8),
+            # Shoulders
+            (9, 10),
+            # Left arm
+            (11, 12), (12, 14), (14, 16),
+            # Right arm  
+            (11, 13), (13, 15), (15, 17),
+            # Torso
+            (11, 23), (12, 24), (23, 24),
+            # Left leg
+            (23, 25), (25, 27), (27, 29), (29, 31),
+            # Right leg
+            (24, 26), (26, 28), (28, 30), (30, 32),
+            # Feet
+            (27, 31), (28, 32)
+        ]
+        
+        for start_idx, end_idx in connections:
+            if start_idx < len(landmarks) and end_idx < len(landmarks):
+                start_landmark = landmarks[start_idx]
+                end_landmark = landmarks[end_idx]
+                
+                # Only draw if both landmarks have reasonable visibility
+                if (start_landmark.get('visibility', 0) > 0.1 and 
+                    end_landmark.get('visibility', 0) > 0.1):
+                    
+                    start_x = int(start_landmark['x'] * self.width)
+                    start_y = int(start_landmark['y'] * self.height)
+                    end_x = int(end_landmark['x'] * self.width)
+                    end_y = int(end_landmark['y'] * self.height)
+                    
+                    # Draw connection line
+                    cv2.line(frame, (start_x, start_y), (end_x, end_y), (0, 255, 255), 2)
         
         return frame
     
@@ -844,74 +832,66 @@ class FixedVideoOverlayWithAnalytics:
         # Create overlay background
         overlay = frame.copy()
         
-        # Analytics panel background
+        # Analytics panel background - white background for black text
         panel_width = 500
         panel_height = 450
-        cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), (0, 0, 0), -1)
-        cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), (255, 255, 255), 2)
+        cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), (255, 255, 255), -1)
+        cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), (0, 0, 0), 2)
         
         # Title
-        cv2.putText(overlay, "FIXED REAL-TIME ANALYTICS", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(overlay, "FIXED REAL-TIME ANALYTICS", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
         
         y_offset = 60
         
         # Frame info
         cv2.putText(overlay, f"Frame: {self.current_frame}/{self.total_frames}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         y_offset += 25
         
         # Ground calibration status
         if self.tumbling_analyzer.ground_calibrated:
             cv2.putText(overlay, "Ground: CALIBRATED", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         else:
             cv2.putText(overlay, "Ground: CALIBRATING...", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         y_offset += 25
         
         # Flight phase
         flight_phase = analytics_data.get('flight_phase', 'ground')
-        phase_color = {
-            'ground': (255, 255, 255),
-            'preparation': (255, 255, 0),
-            'takeoff': (0, 255, 255),
-            'flight': (0, 255, 0),
-            'landing': (255, 0, 0)
-        }.get(flight_phase, (255, 255, 255))
-        
         cv2.putText(overlay, f"Phase: {flight_phase.upper()}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, phase_color, 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
         y_offset += 30
         
         # Tumbling detection
         if analytics_data.get('tumbling_detected', False):
             cv2.putText(overlay, "TUMBLING DETECTED!", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
             y_offset += 30
         
         # Height from ground
         height = analytics_data.get('height_from_ground', 0)
         cv2.putText(overlay, f"Height: {height:.3f}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         y_offset += 25
         
         # Fixed elevation angle (relative to ground)
         elevation = analytics_data.get('elevation_angle', 0)
         cv2.putText(overlay, f"Elevation: {elevation:.1f}°", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         y_offset += 25
         
         # Forward lean angle (relative to vertical)
         lean = analytics_data.get('forward_lean_angle', 0)
         cv2.putText(overlay, f"Forward Lean: {lean:.1f}°", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         y_offset += 25
         
         # COM coordinates
         com = analytics_data.get('com_position')
         if com:
             cv2.putText(overlay, f"COM: ({com['x']:.3f}, {com['y']:.3f}, {com['z']:.3f})", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
             y_offset += 25
         
         # Tumbling quality
@@ -929,106 +909,50 @@ class FixedVideoOverlayWithAnalytics:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, confidence_color, 1)
         y_offset += 30
         
-        # COMPREHENSIVE ACL RISK ASSESSMENT Section
-        cv2.putText(overlay, "COMPREHENSIVE ACL RISK ASSESSMENT", (20, y_offset), 
+        # ACL Risk Assessment Section
+        cv2.putText(overlay, "ACL RISK ASSESSMENT", (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         y_offset += 25
         
-        # Overall ACL Risk with comprehensive data
+        # Overall ACL Risk
         acl_risk_factors = analytics_data.get('acl_risk_factors', {})
         overall_risk = acl_risk_factors.get('overall_acl_risk', 0)
         risk_level = acl_risk_factors.get('risk_level', 'LOW')
         
         # Color code based on risk level
         risk_color = (0, 255, 0) if risk_level == 'LOW' else (255, 255, 0) if risk_level == 'MODERATE' else (255, 0, 0)
-        cv2.putText(overlay, f"Overall ACL Risk: {overall_risk:.1f}/100 ({risk_level})", (20, y_offset), 
+        cv2.putText(overlay, f"ACL Risk: {overall_risk:.1f}/100 ({risk_level})", (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, risk_color, 2)
         y_offset += 25
         
-        # Comprehensive Risk Factor Breakdown
-        cv2.putText(overlay, "Risk Factor Breakdown:", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        # Individual risk factors
+        knee_angle_risk = acl_risk_factors.get('knee_angle_risk', 0)
+        cv2.putText(overlay, f"Knee Angle Risk: {knee_angle_risk:.1f}", (20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         y_offset += 20
         
-        # Knee Flexion Risk (25% weight)
-        knee_angle_risk = acl_risk_factors.get('knee_angle_risk', 0)
-        cv2.putText(overlay, f"• Knee Flexion (25%): {knee_angle_risk:.1f}", (30, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        y_offset += 18
-        
-        # Frontal Plane Risk (40% weight) - Most Important
         knee_valgus_risk = acl_risk_factors.get('knee_valgus_risk', 0)
-        cv2.putText(overlay, f"• Frontal Plane (40%): {knee_valgus_risk:.1f}", (30, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        y_offset += 18
+        cv2.putText(overlay, f"Knee Valgus Risk: {knee_valgus_risk:.1f}", (20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        y_offset += 20
         
-        # Landing Mechanics Risk (30% weight)
         landing_mechanics_risk = acl_risk_factors.get('landing_mechanics_risk', 0)
-        cv2.putText(overlay, f"• Landing Mechanics (30%): {landing_mechanics_risk:.1f}", (30, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        cv2.putText(overlay, f"Landing Mechanics Risk: {landing_mechanics_risk:.1f}", (20, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         y_offset += 25
         
-        # Context Factors (if available)
-        context_factors = acl_risk_factors.get('context_factors', [])
-        if context_factors:
-            cv2.putText(overlay, "Context Factors:", (20, y_offset), 
+        # ACL Recommendations
+        acl_recommendations = analytics_data.get('acl_recommendations', [])
+        if acl_recommendations:
+            cv2.putText(overlay, "Recommendations:", (20, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
             y_offset += 20
             
-            for factor in context_factors[:2]:  # Show first 2 context factors
-                if y_offset < panel_height - 50:
-                    cv2.putText(overlay, f"• {factor}", (30, y_offset), 
+            for i, rec in enumerate(acl_recommendations[:2]):  # Show first 2 recommendations
+                if y_offset < panel_height - 30:  # Don't overflow panel
+                    cv2.putText(overlay, f"• {rec[:40]}...", (30, y_offset), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
                     y_offset += 18
-            y_offset += 10
-        
-        # Comprehensive Coaching Cues
-        coaching_cues = acl_risk_factors.get('coaching_cues', [])
-        if coaching_cues:
-            cv2.putText(overlay, "Coaching Cues:", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-            y_offset += 20
-            
-            for i, cue in enumerate(coaching_cues[:3]):  # Show first 3 coaching cues
-                if y_offset < panel_height - 60:
-                    # Priority color coding
-                    priority = cue.get('priority', 'medium')
-                    priority_color = (255, 0, 0) if priority == 'high' else (255, 255, 0) if priority == 'medium' else (0, 255, 0)
-                    
-                    # Issue
-                    issue = cue.get('issue', '')
-                    cv2.putText(overlay, f"• {issue[:35]}...", (30, y_offset), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, priority_color, 1)
-                    y_offset += 16
-                    
-                    # Cue
-                    cue_text = cue.get('cue', '')
-                    if cue_text and y_offset < panel_height - 60:
-                        cv2.putText(overlay, f"  Cue: {cue_text[:30]}...", (40, y_offset), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 255), 1)
-                        y_offset += 14
-                    
-                    # Drill
-                    drill = cue.get('drill', '')
-                    if drill and y_offset < panel_height - 60:
-                        cv2.putText(overlay, f"  Drill: {drill[:30]}...", (40, y_offset), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 255), 1)
-                        y_offset += 14
-                    
-                    y_offset += 5
-        else:
-            # Fallback to old recommendations format
-            acl_recommendations = analytics_data.get('acl_recommendations', [])
-            if acl_recommendations:
-                cv2.putText(overlay, "Recommendations:", (20, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                y_offset += 20
-                
-                for i, rec in enumerate(acl_recommendations[:2]):  # Show first 2 recommendations
-                    if y_offset < panel_height - 30:  # Don't overflow panel
-                        cv2.putText(overlay, f"• {rec[:40]}...", (30, y_offset), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-                        y_offset += 18
         
         # Blend overlay with original frame
         alpha = 0.8
@@ -1148,7 +1072,7 @@ def main():
     parser = argparse.ArgumentParser(description='Create video overlay with FIXED elevation calculation')
     parser.add_argument('video_path', help='Path to input video file')
     parser.add_argument('--output', '-o', help='Output video path (optional)')
-    parser.add_argument('--server', '-s', default='https://poseserver.onrender.com', help='MediaPipe server URL')
+    parser.add_argument('--server', '-s', default='http://localhost:5001', help='MediaPipe server URL')
     
     args = parser.parse_args()
     
