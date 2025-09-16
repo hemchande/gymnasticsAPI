@@ -27,7 +27,7 @@ import re
 from database2 import db_manager, sessions, users, video_metadata
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app","https://www.motionlabsai.com"], 
+CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app","https://www.motionlabsai.com","https://motionlabsai.vercel.app"], 
      allow_headers=["Content-Type", "Authorization", "Range"],
      expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"])
 
