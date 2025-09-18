@@ -1314,13 +1314,14 @@ def get_per_frame_statistics_by_filename():
             print(f"❌ No session found for video filename: {video_filename}")
             
             # Try to extract original filename from processed filename
-            if video_filename.startswith('h264_analyzed_temp_'):
+            if video_filename.startswith('h264_analyzed_temp_') or video_filename.startswith('enhanced_analyzed_temp_'):
                 # Extract original filename from processed filename
+                # Format: enhanced_analyzed_temp_{timestamp}_{original_filename}_{timestamp}.mp4
                 # Format: h264_analyzed_temp_{timestamp}_{original_filename}_{timestamp}.mp4
                 parts = video_filename.split('_')
                 if len(parts) >= 5:
                     # Find the original filename part (skip timestamp parts)
-                    original_parts = parts[3:-1]  # Skip 'h264', 'analyzed', 'temp', first timestamp, and last timestamp
+                    original_parts = parts[3:-1]  # Skip 'enhanced/h264', 'analyzed', 'temp', first timestamp, and last timestamp
                     original_filename = '_'.join(original_parts) + '.mp4'
                     print(f"🔍 Trying to find session with extracted original filename: {original_filename}")
                     session = sessions.get_session_by_video_filename(original_filename)
@@ -1332,7 +1333,11 @@ def get_per_frame_statistics_by_filename():
                     print(f"📋 Available sessions: {[s.get('processed_video_filename', s.get('original_filename', 'unknown')) for s in all_sessions]}")
                 except Exception as debug_e:
                     print(f"⚠️ Could not list sessions for debugging: {debug_e}")
-                return jsonify({"error": "Session not found"}), 404
+                return jsonify({
+                    "error": "Session not found",
+                    "requested_filename": video_filename,
+                    "message": "No session found for this video filename. Make sure the video has been processed and uploaded to the server."
+                }), 404
         
         analytics_id = session.get('gridfs_analytics_id')
         if not analytics_id:
