@@ -1049,22 +1049,33 @@ def get_job_status():
     """Get job status (frontend compatibility)"""
     try:
         job_id = request.args.get('job_id')
-        if not job_id:
-            return jsonify({"error": "job_id parameter is required"}), 400
+        session_id = request.args.get('session_id')
         
-        # Extract session ID from job ID (format: per_frame_{session_id}_{timestamp})
-        session_id = None
-        if job_id.startswith("per_frame_"):
-            # Extract session ID from job ID
-            parts = job_id.split("_")
-            if len(parts) >= 3:
-                session_id = "_".join(parts[2:-1])  # Everything between "per_frame" and the timestamp
+        if not job_id and not session_id:
+            return jsonify({"error": "job_id or session_id parameter is required"}), 400
+        
+        # If we have a job_id, try to find the session by job_id
+        if job_id:
+            # Try to find session by job_id
+            session = sessions.get_session_by_job_id(job_id)
+            if not session:
+                # Fallback: extract session ID from job ID (format: enhanced_analysis_{timestamp}_{base_name})
+                if job_id.startswith("enhanced_analysis_"):
+                    # For enhanced analysis jobs, we need to find by job_id field
+                    session = sessions.get_session_by_job_id(job_id)
+                elif job_id.startswith("per_frame_"):
+                    # Extract session ID from job ID (format: per_frame_{session_id}_{timestamp})
+                    parts = job_id.split("_")
+                    if len(parts) >= 3:
+                        session_id = "_".join(parts[2:-1])  # Everything between "per_frame" and the timestamp
+                        session = sessions.get_session(session_id)
+                else:
+                    # If it's not a known format, treat it as a direct session ID
+                    session = sessions.get_session(job_id)
         else:
-            # If it's not a per_frame job, treat it as a direct session ID
-            session_id = job_id
+            # Use session_id directly
+            session = sessions.get_session(session_id)
         
-        # Get the actual session data
-        session = sessions.get_session(session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
         
@@ -1080,7 +1091,8 @@ def get_job_status():
                 "result": {
                     "total_frames": session.get("total_frames", 0),
                     "fps": session.get("fps", 30),
-                    "processing_status": session.get("processing_status", "unknown")
+                    "processing_status": session.get("processing_status", "unknown"),
+                    "processing_progress": session.get("processing_progress", 0.0)
                 }
             }
         })
@@ -2537,7 +2549,7 @@ def analyze_video_from_gridfs():
 
 @app.route('/analyzevideo2', methods=['POST'])
 def analyze_video_enhanced():
-    """Analyze video using enhanced overlay script with anti-flickering and comprehensive analytics"""
+    """Analyze video using enhanced overlay script with anti-flickering and comprehensive analytics (ASYNC)"""
     try:
         data = request.get_json()
         video_filename = data.get('video_filename')
@@ -2630,82 +2642,17 @@ def analyze_video_enhanced():
             else:
                 return jsonify({"error": f"Video file not found in GridFS or locally: {video_filename}"}), 404
         
-        # Process the video using enhanced overlay script
-        print(f"🎬 Processing video with ENHANCED analytics: {os.path.basename(video_path)}")
-        
-        # Generate unique output name
+        # Generate unique output name and job ID
         timestamp = int(time.time())
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_name = f"enhanced_analyzed_{base_name}_{timestamp}.mp4"
+        output_name = f"enhanced_analyzed_temp_{timestamp}_{base_name}_{timestamp}.mp4"
         output_path = os.path.join(OUTPUT_DIR, output_name)
+        job_id = f"enhanced_analysis_{timestamp}_{base_name}"
         
         # Ensure output directory exists
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         
-        # Import and use the enhanced overlay script
-        from fixed_video_overlay_with_analytics_enhanced import FixedVideoOverlayWithAnalytics
-        
-        # Create enhanced overlay processor
-        enhanced_processor = FixedVideoOverlayWithAnalytics(video_path, output_path)
-        
-        # Process video with enhanced analytics
-        print(f"🔄 Processing video with enhanced analytics...")
-        enhanced_processor.process_video()
-        
-        # Check if processing was successful
-        if not os.path.exists(output_path):
-            return jsonify({"error": "Enhanced video processing failed"}), 500
-        
-        print(f"✅ Enhanced video processing completed: {output_path}")
-        
-        # Find the analytics file (should be created by the enhanced script)
-        # The enhanced script saves with the original filename, not the temp filename
-        original_filename = os.path.basename(video_path)
-        if original_filename.startswith("temp_"):
-            # Extract original filename from temp filename
-            original_filename = original_filename.split("_", 2)[2] if "_" in original_filename else original_filename
-        
-        analytics_filename = f"fixed_analytics_{original_filename}.json"
-        analytics_path = os.path.join(".", analytics_filename)
-        
-        if not os.path.exists(analytics_path):
-            analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
-        
-        # If still not found, try with the temp filename as fallback
-        if not os.path.exists(analytics_path):
-            temp_analytics_filename = f"fixed_analytics_{os.path.basename(video_path)}.json"
-            temp_analytics_path = os.path.join(".", temp_analytics_filename)
-            if os.path.exists(temp_analytics_path):
-                analytics_path = temp_analytics_path
-                analytics_filename = temp_analytics_filename
-        
-        print(f"📤 Uploading enhanced processed video and analytics to GridFS...")
-        print(f"📊 Video file path: {output_path}")
-        print(f"📊 Video file exists: {os.path.exists(output_path)}")
-        print(f"📊 Analytics file path: {analytics_path}")
-        print(f"📊 Analytics file exists: {os.path.exists(analytics_path)}")
-        if os.path.exists(analytics_path):
-            file_size = os.path.getsize(analytics_path)
-            print(f"📊 Analytics file size: {file_size} bytes")
-        
-        video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
-            output_path, analytics_path, {
-                "athlete_name": athlete_name,
-                "event": event,
-                "session_name": session_name,
-                "user_id": user_id,
-                "date": date,
-                "original_filename": video_filename,
-                "processed_video_filename": output_name,
-                "processing_timestamp": timestamp,
-                "enhanced_analytics": True
-            }
-        )
-        
-        if not video_id:
-            return jsonify({"error": "Failed to upload enhanced processed video to MongoDB"}), 500
-        
-        # Create session record
+        # Create a session record immediately with processing status
         session_data = {
             "user_id": user_id,
             "athlete_name": athlete_name,
@@ -2714,10 +2661,10 @@ def analyze_video_enhanced():
             "date": date,
             "duration": "00:00",
             "original_filename": video_filename,
-            "processed_video_filename": os.path.basename(output_path),
-            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(output_path)}",
-            "analytics_filename": analytics_filename if analytics_id else None,
-            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "processed_video_filename": output_name,
+            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={output_name}",
+            "analytics_filename": None,
+            "analytics_url": None,
             "motion_iq": 0.0,
             "acl_risk": 0.0,
             "precision": 0.0,
@@ -2729,44 +2676,148 @@ def analyze_video_enhanced():
             "highlights": [],
             "areas_for_improvement": [],
             "coach_notes": "",
-            "notes": f"Video analyzed with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
-            "status": "completed",
-            "processing_progress": 1.0,
-            "processing_status": "completed",
-            "gridfs_video_id": video_id,
-            "gridfs_analytics_id": analytics_id,
-            "is_binary_stored": True,
-            "has_landmarks": True,
+            "notes": f"Video analysis started with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
+            "status": "processing",
+            "processing_progress": 0.0,
+            "processing_status": "analyzing",
+            "gridfs_video_id": None,
+            "gridfs_analytics_id": None,
+            "is_binary_stored": False,
+            "has_landmarks": False,
             "enhanced_analytics": True,
+            "job_id": job_id,
             "created_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
         }
         
         session_id = sessions.create_session(session_data)
-        print(f"✅ Enhanced session created: {session_id}")
+        print(f"✅ Created processing session: {session_id} with job_id: {job_id}")
         
-        # Clean up temporary file if it was downloaded from GridFS
-        if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
+        # Start background processing
+        def process_video_background():
             try:
-                os.remove(video_path)
-                print(f"🗑️ Cleaned up temporary file: {video_path}")
+                print(f"🎬 Starting background processing for: {os.path.basename(video_path)}")
+                
+                # Import and use the enhanced overlay script
+                from fixed_video_overlay_with_analytics_enhanced import FixedVideoOverlayWithAnalytics
+                
+                # Create enhanced overlay processor
+                enhanced_processor = FixedVideoOverlayWithAnalytics(video_path, output_path)
+                
+                # Process video with enhanced analytics
+                print(f"🔄 Processing video with enhanced analytics...")
+                enhanced_processor.process_video()
+                
+                # Check if processing was successful
+                if not os.path.exists(output_path):
+                    print(f"❌ Enhanced video processing failed: {output_path}")
+                    sessions.update_session(session_id, {
+                        "status": "failed",
+                        "processing_status": "failed",
+                        "notes": f"Enhanced video processing failed: {video_filename}",
+                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+                    })
+                    return
+                
+                print(f"✅ Enhanced video processing completed: {output_path}")
+                
+                # Find the analytics file
+                original_filename = os.path.basename(video_path)
+                if original_filename.startswith("temp_"):
+                    original_filename = original_filename.split("_", 2)[2] if "_" in original_filename else original_filename
+                
+                analytics_filename = f"fixed_analytics_{original_filename}.json"
+                analytics_path = os.path.join(".", analytics_filename)
+                
+                if not os.path.exists(analytics_path):
+                    analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
+                
+                if not os.path.exists(analytics_path):
+                    temp_analytics_filename = f"fixed_analytics_{os.path.basename(video_path)}.json"
+                    temp_analytics_path = os.path.join(".", temp_analytics_filename)
+                    if os.path.exists(temp_analytics_path):
+                        analytics_path = temp_analytics_path
+                        analytics_filename = temp_analytics_filename
+                
+                # Upload processed video and analytics to GridFS
+                print(f"📤 Uploading enhanced processed video and analytics to GridFS...")
+                video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
+                    output_path, analytics_path, {
+                        "athlete_name": athlete_name,
+                        "event": event,
+                        "session_name": session_name,
+                        "user_id": user_id,
+                        "date": date,
+                        "original_filename": video_filename,
+                        "processed_video_filename": output_name,
+                        "processing_timestamp": timestamp,
+                        "enhanced_analytics": True,
+                        "job_id": job_id
+                    }
+                )
+                
+                if video_id:
+                    # Update session with results
+                    sessions.update_session(session_id, {
+                        "status": "completed",
+                        "processing_status": "completed",
+                        "processing_progress": 100.0,
+                        "gridfs_video_id": video_id,
+                        "gridfs_analytics_id": analytics_id,
+                        "analytics_filename": analytics_filename if analytics_id else None,
+                        "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+                        "is_binary_stored": True,
+                        "has_landmarks": True,
+                        "notes": f"Video analyzed with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
+                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+                    })
+                    print(f"✅ Session updated with results: {session_id}")
+                else:
+                    print(f"❌ Failed to upload to GridFS for session: {session_id}")
+                    sessions.update_session(session_id, {
+                        "status": "failed",
+                        "processing_status": "failed",
+                        "notes": f"Failed to upload processed video to GridFS: {video_filename}",
+                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+                    })
+                
+                # Clean up temporary file
+                if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
+                    try:
+                        os.remove(video_path)
+                        print(f"🗑️ Cleaned up temporary file: {video_path}")
+                    except Exception as e:
+                        print(f"⚠️ Could not clean up temporary file: {e}")
+                
             except Exception as e:
-                print(f"⚠️ Could not clean up temporary file: {e}")
+                print(f"❌ Background processing error: {e}")
+                sessions.update_session(session_id, {
+                    "status": "failed",
+                    "processing_status": "failed",
+                    "notes": f"Background processing failed: {str(e)}",
+                    "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+                })
         
+        # Start background processing in a separate thread
+        import threading
+        background_thread = threading.Thread(target=process_video_background)
+        background_thread.daemon = True
+        background_thread.start()
+        
+        print(f"🚀 Background processing started for job: {job_id}")
+        
+        # Return immediately with job information
         return jsonify({
             "success": True,
-            "message": "Enhanced video analysis completed and uploaded to MongoDB",
+            "message": "Enhanced video analysis started in background",
             "session_id": str(session_id),
-            "video_id": str(video_id),
-            "analytics_id": str(analytics_id) if analytics_id else None,
-            "output_video": os.path.basename(output_path),
-            "analytics_file": analytics_filename if analytics_id else None,
-            "download_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(output_path)}",
-            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "job_id": job_id,
+            "output_video": output_name,
+            "status": "processing",
             "enhanced_analytics": True,
             "features": [
                 "Anti-flickering pose overlay",
-                "Temporal pose smoothing",
+                "Temporal pose smoothing", 
                 "Comprehensive ACL risk assessment",
                 "Enhanced knee valgus calculation",
                 "Landing mechanics analysis",
