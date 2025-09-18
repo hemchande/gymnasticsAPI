@@ -161,6 +161,48 @@ class Session:
         except Exception:
             return []
     
+    def get_session_by_video_filename(self, video_filename: str) -> Optional[Dict[str, Any]]:
+        """Get session by video filename (for frontend compatibility)"""
+        try:
+            # Try to find by processed_video_filename first
+            session = self.collection.find_one({"processed_video_filename": video_filename})
+            if session:
+                session["_id"] = str(session["_id"])
+                return session
+            
+            # Try to find by original_filename, but prioritize sessions with analytics
+            sessions_with_analytics = list(self.collection.find({
+                "original_filename": video_filename,
+                "gridfs_analytics_id": {"$ne": None}
+            }))
+            
+            if sessions_with_analytics:
+                # Return the most recent session with analytics
+                session = max(sessions_with_analytics, key=lambda x: x.get("created_at", ""))
+                session["_id"] = str(session["_id"])
+                return session
+            
+            # Fallback to any session with original_filename
+            session = self.collection.find_one({"original_filename": video_filename})
+            if session:
+                session["_id"] = str(session["_id"])
+                return session
+            
+            # Try to find by any filename field that contains the video filename
+            session = self.collection.find_one({
+                "$or": [
+                    {"processed_video_filename": {"$regex": video_filename, "$options": "i"}},
+                    {"original_filename": {"$regex": video_filename, "$options": "i"}}
+                ]
+            })
+            if session:
+                session["_id"] = str(session["_id"])
+                return session
+            
+            return None
+        except Exception:
+            return None
+    
     def update_session(self, session_id: str, update_data: Dict[str, Any]) -> bool:
         """Update session data"""
         update_data["updated_at"] = datetime.utcnow()
