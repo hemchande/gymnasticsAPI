@@ -24,10 +24,10 @@ from bson import ObjectId
 import re
 
 # Import database modules
-from database2 import db_manager, sessions, users, video_metadata
+from database import db_manager, sessions, users, video_metadata
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app","https://www.motionlabsai.com","https://motionlabsai.vercel.app"], 
+CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app","https://www.motionlabsai.com"], 
      allow_headers=["Content-Type", "Authorization", "Range"],
      expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"])
 
@@ -2527,6 +2527,254 @@ def analyze_video_from_gridfs():
         print(f"❌ Error in analyzeVideo1: {e}")
         return jsonify({
             "error": "Video analysis failed",
+            "details": str(e)
+        }), 500
+
+@app.route('/analyzevideo2', methods=['POST'])
+def analyze_video_enhanced():
+    """Analyze video using enhanced overlay script with anti-flickering and comprehensive analytics"""
+    try:
+        data = request.get_json()
+        video_filename = data.get('video_filename')
+        athlete_name = data.get('athlete_name', 'Unknown Athlete')
+        event = data.get('event', 'Floor Exercise')
+        session_name = data.get('session_name', f'{athlete_name} - {event}')
+        user_id = data.get('user_id', 'demo_user')
+        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
+        
+        if not video_filename:
+            return jsonify({"error": "video_filename is required"}), 400
+        
+        print(f"🔍 Looking for video: {video_filename}")
+        
+        # Check if Railway MediaPipe server is running
+        if not video_processor.check_mediapipe_server():
+            return jsonify({
+                "error": "Railway MediaPipe server is not available",
+                "message": "Please check the Railway MediaPipe server status",
+                "server_url": MEDIAPIPE_SERVER_URL
+            }), 503
+        
+        # First, try to find the session to get GridFS video ID
+        session = sessions.get_session_by_video_filename(video_filename)
+        video_path = None
+        
+        if session and session.get('gridfs_video_id'):
+            # Use GridFS video ID if available (prioritize uploaded video)
+            print(f"🔍 Found session with GridFS video ID: {session['gridfs_video_id']}")
+            try:
+                from bson import ObjectId
+                gridfs_file = fs.get(ObjectId(session['gridfs_video_id']))
+                print(f"✅ Found video in GridFS by session ID: {gridfs_file.filename}")
+                
+                # Download video from GridFS to local temp file
+                os.makedirs(TEMP_DIR, exist_ok=True)
+                temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
+                with open(temp_video_path, 'wb') as temp_file:
+                    temp_file.write(gridfs_file.read())
+                
+                video_path = temp_video_path
+                print(f"📥 Downloaded original video from GridFS to: {video_path}")
+            except Exception as gridfs_error:
+                print(f"⚠️ GridFS lookup by session ID failed: {gridfs_error}")
+                gridfs_file = None
+        
+        if not video_path:
+            # Fallback: try to find video in GridFS by filename
+            print(f"🔍 No session found, searching GridFS for: {video_filename}")
+            
+            # Search for video in GridFS
+            gridfs_file = None
+            try:
+                # Try to find by exact filename first
+                gridfs_file = fs.find_one({"filename": video_filename})
+                
+                # If not found, try to find by partial match
+                if not gridfs_file:
+                    base_name = os.path.splitext(video_filename)[0]
+                    for file_doc in fs.find({"filename": {"$regex": base_name, "$options": "i"}}):
+                        if file_doc.filename.endswith('.mp4'):
+                            gridfs_file = file_doc
+                            break
+                
+                if gridfs_file:
+                    print(f"✅ Found video in GridFS: {gridfs_file.filename}")
+                
+                    # Download video from GridFS to temporary local file
+                    os.makedirs(TEMP_DIR, exist_ok=True)
+                    temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
+                    with open(temp_video_path, 'wb') as temp_file:
+                        temp_file.write(gridfs_file.read())
+                    
+                    video_path = temp_video_path
+                    print(f"📥 Downloaded video from GridFS to: {video_path}")
+                    print(f"✅ Video downloaded successfully: {os.path.getsize(temp_video_path)} bytes")
+                
+            except Exception as e:
+                print(f"❌ Error accessing GridFS: {e}")
+                return jsonify({"error": f"Failed to access video in GridFS: {str(e)}"}), 500
+        
+        # Final fallback: if no video found in GridFS, try local search (but warn about it)
+        if not video_path:
+            print(f"⚠️ No video found in GridFS, trying local search as last resort: {video_filename}")
+            best_video_path, is_h264, original_path = video_processor.find_best_video(video_filename)
+            
+            if best_video_path and os.path.exists(best_video_path):
+                print(f"⚠️ Found local video (this may be a processed video): {best_video_path}")
+                video_path = best_video_path
+            else:
+                return jsonify({"error": f"Video file not found in GridFS or locally: {video_filename}"}), 404
+        
+        # Process the video using enhanced overlay script
+        print(f"🎬 Processing video with ENHANCED analytics: {os.path.basename(video_path)}")
+        
+        # Generate unique output name
+        timestamp = int(time.time())
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        output_name = f"enhanced_analyzed_{base_name}_{timestamp}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_name)
+        
+        # Ensure output directory exists
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Import and use the enhanced overlay script
+        from fixed_video_overlay_with_analytics_enhanced import FixedVideoOverlayWithAnalytics
+        
+        # Create enhanced overlay processor
+        enhanced_processor = FixedVideoOverlayWithAnalytics(video_path, output_path)
+        
+        # Process video with enhanced analytics
+        print(f"🔄 Processing video with enhanced analytics...")
+        enhanced_processor.process_video()
+        
+        # Check if processing was successful
+        if not os.path.exists(output_path):
+            return jsonify({"error": "Enhanced video processing failed"}), 500
+        
+        print(f"✅ Enhanced video processing completed: {output_path}")
+        
+        # Find the analytics file (should be created by the enhanced script)
+        # The enhanced script saves with the original filename, not the temp filename
+        original_filename = os.path.basename(video_path)
+        if original_filename.startswith("temp_"):
+            # Extract original filename from temp filename
+            original_filename = original_filename.split("_", 2)[2] if "_" in original_filename else original_filename
+        
+        analytics_filename = f"fixed_analytics_{original_filename}.json"
+        analytics_path = os.path.join(".", analytics_filename)
+        
+        if not os.path.exists(analytics_path):
+            analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
+        
+        # If still not found, try with the temp filename as fallback
+        if not os.path.exists(analytics_path):
+            temp_analytics_filename = f"fixed_analytics_{os.path.basename(video_path)}.json"
+            temp_analytics_path = os.path.join(".", temp_analytics_filename)
+            if os.path.exists(temp_analytics_path):
+                analytics_path = temp_analytics_path
+                analytics_filename = temp_analytics_filename
+        
+        print(f"📤 Uploading enhanced processed video and analytics to GridFS...")
+        print(f"📊 Video file path: {output_path}")
+        print(f"📊 Video file exists: {os.path.exists(output_path)}")
+        print(f"📊 Analytics file path: {analytics_path}")
+        print(f"📊 Analytics file exists: {os.path.exists(analytics_path)}")
+        if os.path.exists(analytics_path):
+            file_size = os.path.getsize(analytics_path)
+            print(f"📊 Analytics file size: {file_size} bytes")
+        
+        video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
+            output_path, analytics_path, {
+                "athlete_name": athlete_name,
+                "event": event,
+                "session_name": session_name,
+                "user_id": user_id,
+                "date": date,
+                "original_filename": video_filename,
+                "processed_video_filename": output_name,
+                "processing_timestamp": timestamp,
+                "enhanced_analytics": True
+            }
+        )
+        
+        if not video_id:
+            return jsonify({"error": "Failed to upload enhanced processed video to MongoDB"}), 500
+        
+        # Create session record
+        session_data = {
+            "user_id": user_id,
+            "athlete_name": athlete_name,
+            "session_name": session_name,
+            "event": event,
+            "date": date,
+            "duration": "00:00",
+            "original_filename": video_filename,
+            "processed_video_filename": os.path.basename(output_path),
+            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(output_path)}",
+            "analytics_filename": analytics_filename if analytics_id else None,
+            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "motion_iq": 0.0,
+            "acl_risk": 0.0,
+            "precision": 0.0,
+            "power": 0.0,
+            "tumbling_percentage": 0.0,
+            "landmark_confidence": 0.0,
+            "total_frames": 0,
+            "fps": 0.0,
+            "highlights": [],
+            "areas_for_improvement": [],
+            "coach_notes": "",
+            "notes": f"Video analyzed with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
+            "status": "completed",
+            "processing_progress": 1.0,
+            "processing_status": "completed",
+            "gridfs_video_id": video_id,
+            "gridfs_analytics_id": analytics_id,
+            "is_binary_stored": True,
+            "has_landmarks": True,
+            "enhanced_analytics": True,
+            "created_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        }
+        
+        session_id = sessions.create_session(session_data)
+        print(f"✅ Enhanced session created: {session_id}")
+        
+        # Clean up temporary file if it was downloaded from GridFS
+        if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
+            try:
+                os.remove(video_path)
+                print(f"🗑️ Cleaned up temporary file: {video_path}")
+            except Exception as e:
+                print(f"⚠️ Could not clean up temporary file: {e}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Enhanced video analysis completed and uploaded to MongoDB",
+            "session_id": str(session_id),
+            "video_id": str(video_id),
+            "analytics_id": str(analytics_id) if analytics_id else None,
+            "output_video": os.path.basename(output_path),
+            "analytics_file": analytics_filename if analytics_id else None,
+            "download_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(output_path)}",
+            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
+            "enhanced_analytics": True,
+            "features": [
+                "Anti-flickering pose overlay",
+                "Temporal pose smoothing",
+                "Comprehensive ACL risk assessment",
+                "Enhanced knee valgus calculation",
+                "Landing mechanics analysis",
+                "Every frame processing",
+                "Real-time analytics overlay"
+            ],
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in analyzevideo2: {e}")
+        return jsonify({
+            "error": "Enhanced video analysis failed",
             "details": str(e)
         }), 500
 
