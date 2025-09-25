@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Updated Gymnastics API Server with MongoDB Integration
-This server reads analytics files and videos from MongoDB GridFS and provides API endpoints
+Updated Gymnastics API Server with Cloudflare Stream Integration
+This server integrates Cloudflare Stream for video upload and streaming while maintaining MongoDB for metadata
 """
 
-from flask import Flask, request, jsonify, send_file, Response, stream_template
+from flask import Flask, request, jsonify, send_file, Response, stream_template, make_response
 from flask_cors import CORS
+from flask_compress import Compress
+import json
 import subprocess
 import os
 import json
@@ -22,14 +24,50 @@ import io
 import gridfs
 from bson import ObjectId
 import re
+import gc
+import psutil
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from functools import lru_cache
+import hashlib
 
 # Import database modules
 from database import db_manager, sessions, users, video_metadata
 
+# Custom JSON encoder to handle ObjectId and datetime
+class JSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        elif hasattr(obj, 'isoformat'):  # datetime objects
+            return obj.isoformat()
+        return super().default(obj)
+
+# Helper function to convert ObjectIds to strings in dictionaries
+def convert_objectids_to_strings(obj):
+    """Recursively convert ObjectId instances to strings in dictionaries and lists"""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_objectids_to_strings(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectids_to_strings(item) for item in obj]
+    elif hasattr(obj, 'isoformat'):  # datetime objects
+        return obj.isoformat()
+    else:
+        return obj
+
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app","https://www.motionlabsai.com"], 
-     allow_headers=["Content-Type", "Authorization", "Range"],
-     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"])
+app.json_encoder = JSONEncoder
+CORS(app, 
+     origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app", "https://www.motionlabsai.com"], 
+     allow_headers=["Content-Type", "Authorization", "Range", "X-Requested-With", "Accept", "Origin"],
+     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
+     supports_credentials=True)
+
+# Enable response compression
+Compress(app)
 
 # Configuration
 MEDIAPIPE_SERVER_URL = "https://extraordinary-gentleness-production.up.railway.app"
@@ -38,35 +76,32 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_vi
 ANALYTICS_DIR = "../analytics"
 TEMP_DIR = "/tmp" if os.path.exists("/tmp") else "."
 
-# Initialize GridFS
-fs = gridfs.GridFS(db_manager.db)
+# Cloudflare Stream Configuration
+CLOUDFLARE_ACCOUNT_ID = "f2b0714a082195118f53d0b8327f6635"
+CLOUDFLARE_API_TOKEN = "DEmkpIDn5SLgpjTOoDqYrPivnOpD9gnqbVICwzTQ"
+CLOUDFLARE_STREAM_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/stream"
+CLOUDFLARE_STREAM_DOMAIN = "customer-cxebs7nmdazhytrk.cloudflarestream.com"
 
-def parse_range_header(range_header, file_size):
-    """Parse HTTP Range header and return start, end positions"""
-    if not range_header:
-        return 0, file_size - 1
-    
-    # Parse range header (e.g., "bytes=0-1023" or "bytes=1024-")
-    match = re.match(r'bytes=(\d+)-(\d*)', range_header)
-    if not match:
-        return 0, file_size - 1
-    
-    start = int(match.group(1))
-    end_str = match.group(2)
-    
-    if end_str:
-        end = int(end_str)
-    else:
-        end = file_size - 1
-    
-    # Ensure valid range
-    start = max(0, start)
-    end = min(end, file_size - 1)
-    
-    if start > end:
-        return 0, file_size - 1
-    
-    return start, end
+# Performance Configuration
+MAX_WORKERS = 4  # Limit concurrent video processing
+CHUNK_SIZE = 32 * 1024  # 32KB chunks for streaming (reduced for better performance)
+MEMORY_THRESHOLD = 80  # Memory usage threshold (%)
+REQUEST_TIMEOUT = 30  # Request timeout in seconds
+CACHE_SIZE = 100  # LRU cache size for frequently accessed data
+MAX_ANALYTICS_FRAMES = 50  # Limit frames returned per request
+VIDEO_STREAM_TIMEOUT = 60  # Video streaming timeout in seconds
+MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100MB max video size for streaming
+
+# Initialize GridFS (only if MongoDB is available)
+fs = None
+if db_manager.db is not None:
+    fs = gridfs.GridFS(db_manager.db)
+    print("✅ GridFS initialized")
+else:
+    print("⚠️ GridFS not available (MongoDB not connected)")
+
+# Thread pool for async operations
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 class MongoDBVideoProcessor:
     """Video processor that works with MongoDB GridFS"""
@@ -82,106 +117,6 @@ class MongoDBVideoProcessor:
             return response.status_code == 200
         except:
             return False
-    
-    def get_video_from_gridfs(self, video_id):
-        """Retrieve video file from GridFS"""
-        try:
-            if isinstance(video_id, str):
-                video_id = ObjectId(video_id)
-            
-            grid_out = self.fs.get(video_id)
-            return grid_out.read()
-        except Exception as e:
-            print(f"❌ Error retrieving video from GridFS: {e}")
-            return None
-    
-    def get_video_info_from_gridfs(self, video_id):
-        """Get video file metadata from GridFS"""
-        try:
-            if isinstance(video_id, str):
-                video_id = ObjectId(video_id)
-            
-            video_file = self.fs.get(video_id)
-            return {
-                'filename': video_file.filename,
-                'length': video_file.length,
-                'content_type': video_file.content_type,
-                'upload_date': video_file.upload_date
-            }
-        except Exception as e:
-            print(f"❌ Error retrieving video info from GridFS: {e}")
-            return None
-    
-    def stream_video_from_gridfs(self, video_id, start=0, end=None):
-        """Stream video file from GridFS in chunks"""
-        try:
-            if isinstance(video_id, str):
-                video_id = ObjectId(video_id)
-            
-            grid_out = self.fs.get(video_id)
-            total_size = grid_out.length
-            
-            # Set default end if not provided
-            if end is None:
-                end = total_size - 1
-            
-            # Ensure end doesn't exceed file size
-            end = min(end, total_size - 1)
-            
-            # Seek to start position
-            grid_out.seek(start)
-            
-            # Calculate chunk size (1MB chunks for streaming)
-            chunk_size = 1024 * 1024  # 1MB
-            
-            def generate():
-                remaining = end - start + 1
-                current_pos = start
-                
-                while remaining > 0:
-                    # Read chunk
-                    read_size = min(chunk_size, remaining)
-                    chunk = grid_out.read(read_size)
-                    
-                    if not chunk:
-                        break
-                    
-                    yield chunk
-                    
-                    remaining -= len(chunk)
-                    current_pos += len(chunk)
-            
-            return generate(), total_size, start, end
-            
-        except Exception as e:
-            print(f"❌ Error streaming video from GridFS: {e}")
-            return None, 0, 0, 0
-    
-    def get_analytics_from_gridfs(self, analytics_id):
-        """Retrieve analytics file from GridFS"""
-        try:
-            if isinstance(analytics_id, str):
-                analytics_id = ObjectId(analytics_id)
-            
-            grid_out = self.fs.get(analytics_id)
-            return json.loads(grid_out.read().decode('utf-8'))
-        except Exception as e:
-            print(f"❌ Error retrieving analytics from GridFS: {e}")
-            return None
-    
-    def save_video_to_temp(self, video_data, filename):
-        """Save video data to temporary file"""
-        try:
-            temp_dir = tempfile.mkdtemp()
-            temp_path = os.path.join(temp_dir, filename)
-            
-            with open(temp_path, 'wb') as f:
-                f.write(video_data)
-            
-            return temp_path, temp_dir
-        except Exception as e:
-            print(f"❌ Error saving video to temp: {e}")
-            return None, None
     
     def find_best_video(self, video_filename):
         """
@@ -274,128 +209,6 @@ class MongoDBVideoProcessor:
                 "message": "Video processing error"
             }
     
-    def process_video_with_railway_mediapipe(self, video_path, video_filename, athlete_name, event, session_name, user_id, date):
-        """Process video using Railway MediaPipe server and upload to GridFS"""
-        try:
-            print(f"🎬 Processing video: {video_filename}")
-            
-            # Check if MediaPipe server is available
-            if not self.check_mediapipe_server():
-                return {
-                    "success": False,
-                    "error": "MediaPipe server is not available",
-                    "message": "Cannot process video without MediaPipe server"
-                }
-            
-            # Generate output filename (clean naming, no h264 prefix)
-            timestamp = int(time.time())
-            base_name = os.path.splitext(video_filename)[0]
-            # Remove existing h264_ prefix if present to avoid accumulation
-            if base_name.startswith('h264_'):
-                base_name = base_name[5:]  # Remove 'h264_' prefix
-            output_name = f"analyzed_temp_{timestamp}_{base_name}_{timestamp}.mp4"
-            output_path = os.path.join(TEMP_DIR, output_name)
-            
-            # Process video with MediaPipe
-            print(f"🔄 Processing video with MediaPipe...")
-            result = self.process_video_with_analytics(video_path, output_name)
-            
-            if not result.get("success"):
-                return {
-                    "success": False,
-                    "error": "Video processing failed",
-                    "message": result.get("error", "Unknown processing error")
-                }
-            
-            # Upload processed video and analytics to GridFS
-            analytics_path = result.get("analytics_file")
-            metadata = {
-                "athlete_name": athlete_name,
-                "event": event,
-                "session_name": session_name,
-                "user_id": user_id,
-                "date": date,
-                "original_filename": video_filename,
-                "processed_video_filename": output_name
-            }
-            
-            video_id, analytics_id = self.upload_processed_video_to_gridfs(
-                output_path, analytics_path, metadata
-            )
-            
-            if not video_id:
-                return {
-                    "success": False,
-                    "error": "Failed to upload processed video to GridFS",
-                    "message": "Video was processed but could not be stored"
-                }
-            
-            # Create session record
-            session_data = {
-                "user_id": user_id,
-                "athlete_name": athlete_name,
-                "session_name": session_name,
-                "event": event,
-                "date": date,
-                "duration": result.get("duration", "00:00"),
-                "original_filename": video_filename,
-                "processed_video_filename": output_name,
-                "processed_video_url": f"http://localhost:5004/getVideo?video_filename={output_name}",
-                "analytics_filename": os.path.basename(analytics_path) if analytics_path else None,
-                "analytics_url": f"http://localhost:5004/getPerFrameStatistics?video_filename={output_name}",
-                "motion_iq": result.get("motion_iq", 0.0),
-                "acl_risk": result.get("acl_risk", 0.0),
-                "precision": result.get("precision", 0.0),
-                "power": result.get("power", 0.0),
-                "tumbling_percentage": result.get("tumbling_percentage", 0.0),
-                "status": "completed",
-                "processing_progress": 100.0,
-                "total_frames": result.get("total_frames", 0),
-                "fps": result.get("fps", 0.0),
-                "has_landmarks": result.get("has_landmarks", False),
-                "landmark_confidence": result.get("landmark_confidence", 0.0),
-                "notes": f"Video processed successfully: {video_filename}",
-                "coach_notes": "",
-                "highlights": result.get("highlights", []),
-                "areas_for_improvement": result.get("areas_for_improvement", []),
-                "gridfs_video_id": video_id,
-                "gridfs_analytics_id": analytics_id,
-                "is_binary_stored": True,
-                "processing_status": "completed"
-            }
-            
-            session_id = sessions.create_session(session_data)
-            
-            # Clean up temporary files
-            try:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                if analytics_path and os.path.exists(analytics_path):
-                    os.remove(analytics_path)
-            except Exception as cleanup_error:
-                print(f"⚠️ Warning: Could not clean up temporary files: {cleanup_error}")
-            
-            return {
-                "success": True,
-                "message": "Video processed and uploaded successfully",
-                "session_id": session_id,
-                "video_id": video_id,
-                "analytics_id": analytics_id,
-                "output_video": output_name,
-                "analytics_file": analytics_path,
-                "download_url": f"http://localhost:5004/getVideo?video_filename={output_name}",
-                "analytics_url": f"http://localhost:5004/getPerFrameStatistics?video_filename={output_name}",
-                "timestamp": datetime.now().isoformat()
-            }
-            
-        except Exception as e:
-            print(f"❌ Error processing video with Railway MediaPipe: {e}")
-            return {
-                "success": False,
-                "error": "Video processing failed",
-                "message": str(e)
-            }
-
     def upload_processed_video_to_gridfs(self, video_path, analytics_path, metadata=None):
         """Upload processed video and analytics to GridFS and create session"""
         try:
@@ -442,1110 +255,996 @@ class MongoDBVideoProcessor:
         except Exception as e:
             print(f"❌ Error uploading to GridFS: {e}")
             return None, None
+    
+    def get_analytics_from_gridfs(self, analytics_id):
+        """Retrieve analytics file from GridFS with caching"""
+        try:
+            if isinstance(analytics_id, str):
+                analytics_id = ObjectId(analytics_id)
+            
+            grid_out = self.fs.get(analytics_id)
+            return json.loads(grid_out.read().decode('utf-8'))
+        except Exception as e:
+            print(f"❌ Error retrieving analytics from GridFS: {e}")
+            return None
 
 # Initialize video processor
 video_processor = MongoDBVideoProcessor()
 
+def convert_timestamps_to_relative(analytics_data):
+    """Convert Unix timestamps to relative timestamps for video synchronization"""
+    try:
+        # Handle both list format and dict format
+        if isinstance(analytics_data, list):
+            # Direct list of frames
+            frame_data = analytics_data
+        elif 'frame_data' in analytics_data and isinstance(analytics_data['frame_data'], list):
+            # Dictionary with frame_data key
+            frame_data = analytics_data['frame_data']
+        else:
+            # No frame data found
+            return analytics_data
+            
+        if len(frame_data) == 0:
+            return analytics_data
+            
+        # Get the first timestamp as the baseline
+        first_timestamp = None
+        for frame in frame_data:
+            if 'metrics' in frame and 'timestamp' in frame['metrics']:
+                first_timestamp = frame['metrics']['timestamp']
+                break
+        
+        if first_timestamp is None:
+            print("⚠️ No timestamps found in frame data")
+            return analytics_data
+        
+        # Convert all timestamps to relative time (seconds from start)
+        for frame in frame_data:
+            if 'metrics' in frame and 'timestamp' in frame['metrics']:
+                original_timestamp = frame['metrics']['timestamp']
+                relative_time = original_timestamp - first_timestamp
+                frame['timestamp'] = relative_time  # Add relative timestamp at frame level
+                frame['metrics']['relative_timestamp'] = relative_time  # Keep relative timestamp in metrics too
+        
+        print(f"✅ Converted {len(frame_data)} frames to relative timestamps (baseline: {first_timestamp})")
+        
+        return analytics_data
+        
+    except Exception as e:
+        print(f"❌ Error converting timestamps: {e}")
+        return analytics_data
+
+# Global OPTIONS handler for CORS preflight requests
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "*")
+        response.headers.add('Access-Control-Allow-Methods', "*")
+        return response
+
+# Cloudflare Stream API Helper Functions
+def upload_to_cloudflare_stream(video_path, metadata=None):
+    """
+    Upload a video to Cloudflare Stream
+    
+    Args:
+        video_path (str): Path to the video file
+        metadata (dict): Optional metadata for the video
+    
+    Returns:
+        dict: Cloudflare Stream response with video ID and details
+    """
+    try:
+        print(f"🌊 Uploading video to Cloudflare Stream: {video_path}")
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}',
+        }
+        
+        # Prepare files and data
+        files = {
+            'file': open(video_path, 'rb')
+        }
+        
+        data = {}
+        if metadata:
+            data['meta'] = json.dumps(metadata)
+        
+        # Upload to Cloudflare Stream
+        response = requests.post(
+            CLOUDFLARE_STREAM_BASE_URL,
+            headers=headers,
+            files=files,
+            data=data,
+            timeout=300  # 5 minute timeout for uploads
+        )
+        
+        files['file'].close()
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                video_data = result.get('result', {})
+                print(f"✅ Video uploaded to Cloudflare Stream successfully")
+                print(f"📊 Video UID: {video_data.get('uid')}")
+                print(f"📊 Video Size: {video_data.get('size')} bytes")
+                return video_data
+            else:
+                print(f"❌ Cloudflare Stream upload failed: {result.get('errors', [])}")
+                return None
+        else:
+            print(f"❌ Cloudflare Stream upload failed with status {response.status_code}: {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error uploading to Cloudflare Stream: {e}")
+        return None
+
+def get_cloudflare_stream_url(video_uid):
+    """
+    Get the streaming URL for a Cloudflare Stream video
+    
+    Args:
+        video_uid (str): Cloudflare Stream video UID
+    
+    Returns:
+        str: Streaming URL for the video
+    """
+    # Use iframe URL for now - this should work with HTML5 video elements
+    # Cloudflare Stream iframe URLs can be used directly in video src
+    return f"https://{CLOUDFLARE_STREAM_DOMAIN}/{video_uid}/iframe"
+
+def get_cloudflare_video_info(video_uid):
+    """
+    Get video information from Cloudflare Stream
+    
+    Args:
+        video_uid (str): Cloudflare Stream video UID
+    
+    Returns:
+        dict: Video information from Cloudflare Stream
+    """
+    try:
+        headers = {
+            'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}',
+        }
+        
+        response = requests.get(
+            f"{CLOUDFLARE_STREAM_BASE_URL}/{video_uid}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                return result.get('result', {})
+            else:
+                print(f"❌ Failed to get Cloudflare video info: {result.get('errors', [])}")
+                return None
+        else:
+            print(f"❌ Failed to get Cloudflare video info with status {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error getting Cloudflare video info: {e}")
+        return None
+
+def list_cloudflare_videos(limit=100):
+    """
+    List videos from Cloudflare Stream
+    
+    Args:
+        limit (int): Maximum number of videos to return
+    
+    Returns:
+        list: List of video information from Cloudflare Stream
+    """
+    try:
+        headers = {
+            'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}',
+        }
+        
+        response = requests.get(
+            f"{CLOUDFLARE_STREAM_BASE_URL}?limit={limit}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                return result.get('result', [])
+            else:
+                print(f"❌ Failed to list Cloudflare videos: {result.get('errors', [])}")
+                return []
+        else:
+            print(f"❌ Failed to list Cloudflare videos with status {response.status_code}")
+            return []
+            
+    except Exception as e:
+        print(f"❌ Error listing Cloudflare videos: {e}")
+        return []
+
+def enable_cloudflare_stream_download(video_uid):
+    """
+    Enable MP4 download for a Cloudflare Stream video
+    
+    Args:
+        video_uid (str): Cloudflare Stream video UID
+    
+    Returns:
+        dict: Download info with status and URL, or None if failed
+    """
+    try:
+        print(f"🌊 Enabling MP4 download for video: {video_uid}")
+        
+        headers = {'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'}
+        
+        # Enable MP4 download
+        response = requests.post(
+            f"{CLOUDFLARE_STREAM_BASE_URL}/{video_uid}/downloads",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                download_info = result.get('result', {}).get('default', {})
+                print(f"✅ MP4 download enabled: {download_info.get('status')}")
+                return download_info
+            else:
+                print(f"❌ Failed to enable MP4 download: {result.get('errors', [])}")
+                return None
+        else:
+            print(f"❌ Failed to enable MP4 download with status {response.status_code}")
+            print(f"❌ Response body: {response.text}")
+            try:
+                error_data = response.json()
+                print(f"❌ Error details: {error_data}")
+            except:
+                print(f"❌ Could not parse error response as JSON")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error enabling MP4 download: {e}")
+        return None
+
+def get_cloudflare_stream_download_status(video_uid):
+    """
+    Get download status for a Cloudflare Stream video
+    
+    Args:
+        video_uid (str): Cloudflare Stream video UID
+    
+    Returns:
+        dict: Download info with status and URL, or None if failed
+    """
+    try:
+        headers = {'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'}
+        
+        response = requests.get(
+            f"{CLOUDFLARE_STREAM_BASE_URL}/{video_uid}/downloads",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                download_info = result.get('result', {}).get('default', {})
+                return download_info
+            else:
+                print(f"❌ Failed to get download status: {result.get('errors', [])}")
+                return None
+        else:
+            print(f"❌ Failed to get download status with status {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error getting download status: {e}")
+        return None
+
+def download_video_from_cloudflare_stream(video_uid, output_path):
+    """
+    Download a video from Cloudflare Stream to local file
+    
+    Args:
+        video_uid (str): Cloudflare Stream video UID
+        output_path (str): Local path to save the video
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        print(f"🌊 Downloading video from Cloudflare Stream: {video_uid}")
+        
+        # First, check if download is already available
+        download_info = get_cloudflare_stream_download_status(video_uid)
+        
+        if not download_info:
+            # Enable MP4 download if not available
+            print(f"🔄 Enabling MP4 download for video: {video_uid}")
+            download_info = enable_cloudflare_stream_download(video_uid)
+            
+            if not download_info:
+                print(f"❌ Failed to enable MP4 download for video: {video_uid}")
+                return False
+        
+        # Check if download is ready
+        if download_info.get('status') == 'ready':
+            download_url = download_info.get('url')
+            print(f"✅ Download is ready: {download_url}")
+        else:
+            # Poll until download is ready
+            print(f"⏳ Download status: {download_info.get('status')}, polling until ready...")
+            max_attempts = 30  # 5 minutes max
+            attempt = 0
+            
+            while attempt < max_attempts:
+                time.sleep(10)  # Wait 10 seconds between polls
+                download_info = get_cloudflare_stream_download_status(video_uid)
+                
+                if not download_info:
+                    print(f"❌ Failed to get download status")
+                    return False
+                
+                status = download_info.get('status')
+                percent = download_info.get('percentComplete', 0)
+                
+                print(f"📊 Download progress: {status} ({percent}%)")
+                
+                if status == 'ready':
+                    download_url = download_info.get('url')
+                    print(f"✅ Download is ready: {download_url}")
+                    break
+                elif status == 'error':
+                    print(f"❌ Download failed")
+                    return False
+                
+                attempt += 1
+            
+            if attempt >= max_attempts:
+                print(f"❌ Download timeout after {max_attempts} attempts")
+                return False
+        
+        # Download the video
+        if not download_url:
+            print(f"❌ No download URL available")
+            return False
+        
+        print(f"📥 Downloading from: {download_url}")
+        
+        # Download the video
+        headers = {'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'}
+        response = requests.get(download_url, headers=headers, stream=True, timeout=300)
+        
+        if response.status_code == 200:
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Write video to file
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            file_size = os.path.getsize(output_path)
+            print(f"✅ Video downloaded successfully: {output_path} ({file_size} bytes)")
+            return True
+        else:
+            print(f"❌ Failed to download video with status {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error downloading video from Cloudflare Stream: {e}")
+        return False
+
+# Performance monitoring
+def check_memory_usage():
+    """Check current memory usage and trigger cleanup if needed"""
+    try:
+        memory_percent = psutil.virtual_memory().percent
+        if memory_percent > MEMORY_THRESHOLD:
+            print(f"⚠️ High memory usage: {memory_percent:.1f}%")
+            gc.collect()  # Force garbage collection
+            return True
+        return False
+    except Exception as e:
+        print(f"❌ Error checking memory: {e}")
+        return False
+
+def monitor_performance(func):
+    """Decorator to monitor function performance"""
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        start_memory = psutil.virtual_memory().used if hasattr(psutil, 'virtual_memory') else 0
+        
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            end_time = time.time()
+            end_memory = psutil.virtual_memory().used if hasattr(psutil, 'virtual_memory') else 0
+            
+            execution_time = end_time - start_time
+            memory_delta = end_memory - start_memory
+            
+            if execution_time > 5.0:  # Log slow operations
+                print(f"⏱️ Slow operation: {func.__name__} took {execution_time:.2f}s, memory delta: {memory_delta/1024/1024:.1f}MB")
+            
+            # Check memory usage after operation
+            check_memory_usage()
+    
+    return wrapper
+
+# Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    mediapipe_status = video_processor.check_mediapipe_server()
-    mongodb_status = True
-    
     try:
+        # Check MongoDB connection
         db_manager.client.admin.command('ping')
-    except:
-        mongodb_status = False
+        mongodb_status = "connected"
+    except Exception as e:
+        mongodb_status = f"error: {str(e)}"
+    
+    # Check MediaPipe server
+    try:
+        response = requests.get(f"{MEDIAPIPE_SERVER_URL}/health", timeout=5)
+        mediapipe_status = "running" if response.status_code == 200 else "error"
+    except Exception:
+        mediapipe_status = "error"
+    
+    # Check Cloudflare Stream
+    try:
+        headers = {'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'}
+        response = requests.get(f"{CLOUDFLARE_STREAM_BASE_URL}?limit=1", headers=headers, timeout=10)
+        cloudflare_status = "connected" if response.status_code == 200 else "error"
+    except Exception:
+        cloudflare_status = "error"
     
     return jsonify({
         "status": "healthy",
-        "mediapipe_server": "running" if mediapipe_status else "down",
-        "mongodb": "connected" if mongodb_status else "disconnected",
+        "mongodb": mongodb_status,
+        "mediapipe_server": mediapipe_status,
+        "cloudflare_stream": cloudflare_status,
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route('/getSessions', methods=['GET'])
-def get_sessions():
-    """Get all sessions from MongoDB"""
+# Cloudflare Stream Upload Endpoint
+@app.route('/stream/upload', methods=['POST'])
+@monitor_performance
+def upload_to_stream():
+    """Upload a video to Cloudflare Stream and create a session in MongoDB"""
     try:
-        sessions_list = sessions.get_all_sessions()
+        if 'video' not in request.files:
+            return jsonify({"error": "No video file provided"}), 400
         
-        # Add GridFS file information and convert ObjectIds to strings
-        for session in sessions_list:
-            # Convert ObjectIds to strings for JSON serialization
-            if session.get('_id'):
-                session['_id'] = str(session['_id'])
-            if session.get('gridfs_video_id'):
-                session['gridfs_video_id'] = str(session['gridfs_video_id'])
-                try:
-                    video_file = fs.get(ObjectId(session['gridfs_video_id']))
-                    session['video_size'] = video_file.length
-                    session['video_upload_date'] = video_file.upload_date.isoformat()
-                except:
-                    session['video_size'] = 0
-                    session['video_upload_date'] = None
+        file = request.files['video']
+        if file.filename == '':
+            return jsonify({"error": "No video file selected"}), 400
+        
+        # Get metadata from form
+        athlete_name = request.form.get('athlete_name', 'Unknown Athlete')
+        event = request.form.get('event', 'Unknown Event')
+        session_name = request.form.get('session_name', file.filename)
+        description = request.form.get('description', '')
+        
+        # Save uploaded file temporarily
+        temp_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{file.filename}")
+        file.save(temp_path)
+        
+        try:
+            # Prepare metadata for Cloudflare Stream
+            metadata = {
+                "name": file.filename,
+                "athlete_name": athlete_name,
+                "event": event,
+                "session_name": session_name,
+                "description": description,
+                "upload_source": "gymnastics_api_server_updated2"
+            }
             
-            if session.get('gridfs_analytics_id'):
-                session['gridfs_analytics_id'] = str(session['gridfs_analytics_id'])
-                try:
-                    analytics_file = fs.get(ObjectId(session['gridfs_analytics_id']))
-                    session['analytics_size'] = analytics_file.length
-                    session['analytics_upload_date'] = analytics_file.upload_date.isoformat()
-                except:
-                    session['analytics_size'] = 0
-                    session['analytics_upload_date'] = None
+            # Upload to Cloudflare Stream
+            cloudflare_video = upload_to_cloudflare_stream(temp_path, metadata)
+            
+            if not cloudflare_video:
+                return jsonify({"error": "Failed to upload video to Cloudflare Stream"}), 500
+            
+            # Get streaming URL
+            stream_url = get_cloudflare_stream_url(cloudflare_video.get('uid'))
+            
+            # Create session in MongoDB with Cloudflare Stream integration
+            session_data = {
+                "athlete_name": athlete_name,
+                "session_name": session_name,
+                "event": event,
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "duration": f"{cloudflare_video.get('duration', 0):.1f}s",
+                "original_filename": file.filename,
+                "processed_video_filename": file.filename,
+                "processed_video_url": stream_url,
+                "status": "uploaded",
+                "processing_status": "completed",
+                "is_binary_stored": False,  # Stored in Cloudflare Stream, not GridFS
+                "meta": {
+                    "cloudflare_stream_id": cloudflare_video.get('uid'),
+                    "cloudflare_uid": cloudflare_video.get('uid'),
+                    "upload_source": "cloudflare_stream",
+                    "upload_timestamp": datetime.now().isoformat(),
+                    "video_size": cloudflare_video.get('size'),
+                    "video_duration": cloudflare_video.get('duration'),
+                    "ready_to_stream": cloudflare_video.get('readyToStream', False),
+                    "stream_url": stream_url,
+                    "thumbnail": cloudflare_video.get('thumbnail'),
+                    "description": description
+                },
+                "created_at": datetime.now(),
+                "updated_at": datetime.now()
+            }
+            
+            # Save session to MongoDB
+            session_id = sessions.create_session(session_data)
+            
+            print(f"✅ Session created with Cloudflare Stream integration: {session_id}")
+            
+            return jsonify({
+                "success": True,
+                "message": "Video uploaded to Cloudflare Stream successfully",
+                "session_id": session_id,
+                "video": {
+                    "id": cloudflare_video.get('uid'),
+                    "uid": cloudflare_video.get('uid'),
+                    "filename": file.filename,
+                    "size": cloudflare_video.get('size'),
+                    "duration": cloudflare_video.get('duration'),
+                    "ready_to_stream": cloudflare_video.get('readyToStream', False),
+                    "stream_url": stream_url,
+                    "thumbnail": cloudflare_video.get('thumbnail'),
+                    "created": cloudflare_video.get('created')
+                }
+            })
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+    except Exception as e:
+        print(f"❌ Error in stream upload: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# List Cloudflare Stream Videos
+@app.route('/stream/videos', methods=['GET'])
+def list_stream_videos():
+    """List videos from Cloudflare Stream"""
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        videos = list_cloudflare_videos(limit)
+        
+        # Convert to response format
+        video_list = []
+        for video in videos:
+            stream_url = get_cloudflare_stream_url(video.get('uid'))
+            video_list.append({
+                "id": video.get('uid'),
+                "uid": video.get('uid'),
+                "size": video.get('size'),
+                "duration": video.get('duration'),
+                "ready_to_stream": video.get('readyToStream', False),
+                "stream_url": stream_url,
+                "thumbnail": video.get('thumbnail'),
+                "created": video.get('created'),
+                "meta": video.get('meta', {})
+            })
         
         return jsonify({
             "success": True,
-            "sessions": sessions_list,
-            "count": len(sessions_list),
-            "timestamp": datetime.now().isoformat()
+            "videos": video_list,
+            "count": len(video_list)
+        })
+        
+    except Exception as e:
+        print(f"❌ Error listing stream videos: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Get Cloudflare Stream Video Info
+@app.route('/stream/video/<video_id>', methods=['GET'])
+def get_stream_video(video_id):
+    """Get video information from Cloudflare Stream"""
+    try:
+        video_info = get_cloudflare_video_info(video_id)
+        
+        if not video_info:
+            return jsonify({"error": "Video not found"}), 404
+        
+        stream_url = get_cloudflare_stream_url(video_id)
+        
+        return jsonify({
+            "success": True,
+            "video": {
+                "id": video_info.get('uid'),
+                "uid": video_info.get('uid'),
+                "size": video_info.get('size'),
+                "duration": video_info.get('duration'),
+                "ready_to_stream": video_info.get('readyToStream', False),
+                "stream_url": stream_url,
+                "thumbnail": video_info.get('thumbnail'),
+                "created": video_info.get('created'),
+                "meta": video_info.get('meta', {})
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ Error getting stream video: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Enhanced getVideo endpoint with Cloudflare Stream integration
+@app.route('/getVideo', methods=['GET', 'HEAD'])
+def get_video():
+    """Enhanced getVideo endpoint with Cloudflare Stream integration"""
+    try:
+        video_filename = request.args.get('video_filename')
+        if not video_filename:
+            return jsonify({"error": "video_filename parameter is required"}), 400
+        
+        print(f"🎬 Requesting video: {video_filename}")
+        
+        # Priority 1: Check if video is in Cloudflare Stream via MongoDB
+        session = sessions.get_session_by_video_filename(video_filename)
+        if session and session.get('meta', {}).get('cloudflare_uid'):
+            cloudflare_uid = session['meta']['cloudflare_uid']
+            
+            # For analyzed videos, check if there's an analyzed stream URL
+            if session.get('meta', {}).get('analyzed_stream_url'):
+                analyzed_url = session['meta']['analyzed_stream_url']
+                print(f"🌊 Using analyzed Cloudflare Stream URL: {analyzed_url}")
+                return Response(
+                    response=json.dumps({"redirect_url": analyzed_url}),
+                    status=302,
+                    headers={"Location": analyzed_url}
+                )
+            else:
+                # Use original stream URL
+                stream_url = session['meta'].get('stream_url')
+                if stream_url:
+                    print(f"🌊 Using original Cloudflare Stream URL: {stream_url}")
+                    return Response(
+                        response=json.dumps({"redirect_url": stream_url}),
+                        status=302,
+                        headers={"Location": stream_url}
+                    )
+                else:
+                    # Fallback to constructed URL
+                    stream_url = get_cloudflare_stream_url(cloudflare_uid)
+                    print(f"🌊 Constructed Cloudflare Stream URL: {stream_url}")
+                    return Response(
+                        response=json.dumps({"redirect_url": stream_url}),
+                        status=302,
+                        headers={"Location": stream_url}
+                    )
+        
+        # Priority 2: Check local cache (if implemented)
+        # This would check for locally cached videos
+        
+        # Priority 3: Fall back to GridFS
+        if session and session.get('gridfs_video_id'):
+            video_id = session['gridfs_video_id']
+            return stream_video_from_gridfs(video_id, video_filename)
+        
+        return jsonify({"error": "Video not found"}), 404
+        
+    except Exception as e:
+        print(f"❌ Error in getVideo: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# GridFS streaming function (from original server)
+def stream_video_from_gridfs(video_id, video_filename):
+    """Stream video from GridFS with range support"""
+    try:
+        # Get video from GridFS
+        video_file = fs.get(ObjectId(video_id))
+        if not video_file:
+            return jsonify({"error": "Video not found in GridFS"}), 404
+        
+        file_size = video_file.length
+        
+        # Handle range requests
+        range_header = request.headers.get('Range')
+        if range_header:
+            # Parse range header
+            range_match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+            if range_match:
+                start = int(range_match.group(1))
+                end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+                
+                # Ensure end doesn't exceed file size
+                end = min(end, file_size - 1)
+                
+                # Read the requested range
+                video_file.seek(start)
+                data = video_file.read(end - start + 1)
+                
+                # Create response with range headers
+                response = Response(
+                    data,
+                    status=206,
+                    headers={
+                        'Content-Range': f'bytes {start}-{end}/{file_size}',
+                        'Accept-Ranges': 'bytes',
+                        'Content-Length': str(len(data)),
+                        'Content-Type': 'video/mp4',
+                        'Cache-Control': 'public, max-age=3600'
+                    }
+                )
+                return response
+        
+        # Serve entire file
+        video_file.seek(0)
+        return Response(
+            video_file,
+            mimetype='video/mp4',
+            headers={
+                'Content-Length': str(file_size),
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'public, max-age=3600'
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Error streaming video from GridFS: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Get sessions endpoint (enhanced with Cloudflare Stream info)
+@app.route('/getSessions', methods=['GET'])
+def get_sessions():
+    """Get all sessions with Cloudflare Stream integration info"""
+    try:
+        all_sessions = sessions.get_all_sessions()
+        
+        # Enhance sessions with Cloudflare Stream info
+        enhanced_sessions = []
+        for session in all_sessions:
+            enhanced_session = session.copy()
+            
+            # Add Cloudflare Stream info if available
+            if session.get('meta', {}).get('cloudflare_uid'):
+                cloudflare_uid = session['meta']['cloudflare_uid']
+                enhanced_session['cloudflare_stream_url'] = get_cloudflare_stream_url(cloudflare_uid)
+                enhanced_session['has_cloudflare_stream'] = True
+            else:
+                enhanced_session['has_cloudflare_stream'] = False
+            
+            # Convert ObjectIds to strings
+            enhanced_session = convert_objectids_to_strings(enhanced_session)
+            enhanced_sessions.append(enhanced_session)
+        
+        return jsonify({
+            "sessions": enhanced_sessions,
+            "count": len(enhanced_sessions)
         })
         
     except Exception as e:
         print(f"❌ Error getting sessions: {e}")
-        return jsonify({
-            "error": "Failed to retrieve sessions",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
+# Get sessions by user ID endpoint
+@app.route('/getSessionsByUser/<user_id>', methods=['GET'])
+def get_sessions_by_user(user_id):
+    """Get sessions for a specific user with Cloudflare Stream integration info"""
+    try:
+        # Get all sessions first
+        all_sessions = sessions.get_all_sessions()
+        
+        # Filter sessions by user_id
+        user_sessions = []
+        for session in all_sessions:
+            # Check if session belongs to the user
+            session_user_id = session.get('user_id', '')
+            session_athlete_name = session.get('athlete_name', '')
+            
+            # More restrictive matching logic:
+            # 1. Direct user_id match (exact match)
+            # 2. Athlete name matches user email (for sessions without proper user_id)
+            # 3. Only include "demo_user" sessions if they were created by this specific user
+            should_include = False
+            
+            if session_user_id == user_id or session_user_id == user_id.lower():
+                should_include = True
+            elif session_athlete_name == user_id or session_athlete_name == user_id.lower():
+                should_include = True
+            elif not session_user_id and session_athlete_name:
+                # If no user_id set but athlete_name exists, include it
+                should_include = True
+            
+            # Don't include "demo_user" sessions for real users unless they specifically match
+            
+            if should_include:
+                enhanced_session = session.copy()
+                
+                # Add Cloudflare Stream info if available
+                if session.get('meta', {}).get('cloudflare_uid'):
+                    cloudflare_uid = session['meta']['cloudflare_uid']
+                    enhanced_session['cloudflare_stream_url'] = get_cloudflare_stream_url(cloudflare_uid)
+                    enhanced_session['has_cloudflare_stream'] = True
+                else:
+                    enhanced_session['has_cloudflare_stream'] = False
+                
+                # Convert ObjectIds to strings
+                enhanced_session = convert_objectids_to_strings(enhanced_session)
+                user_sessions.append(enhanced_session)
+        
+        print(f"🔍 Found {len(user_sessions)} sessions for user: {user_id}")
+        
+        return jsonify({
+            "sessions": user_sessions,
+            "count": len(user_sessions),
+            "user_id": user_id
+        })
+        
+    except Exception as e:
+        print(f"❌ Error getting sessions for user {user_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Get session by ID endpoint (enhanced)
 @app.route('/getSession/<session_id>', methods=['GET'])
 def get_session(session_id):
-    """Get specific session by ID"""
+    """Get a specific session with Cloudflare Stream integration info"""
     try:
         session = sessions.get_session(session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
         
-        # Add GridFS file information and convert ObjectIds to strings
-        if session.get('_id'):
-            session['_id'] = str(session['_id'])
-        if session.get('gridfs_video_id'):
-            session['gridfs_video_id'] = str(session['gridfs_video_id'])
-            try:
-                video_file = fs.get(ObjectId(session['gridfs_video_id']))
-                session['video_size'] = video_file.length
-                session['video_upload_date'] = video_file.upload_date.isoformat()
-                session['video_content_type'] = video_file.content_type
-            except:
-                session['video_size'] = 0
-                session['video_upload_date'] = None
-                session['video_content_type'] = None
+        # Add Cloudflare Stream info if available
+        if session.get('meta', {}).get('cloudflare_uid'):
+            cloudflare_uid = session['meta']['cloudflare_uid']
+            session['cloudflare_stream_url'] = get_cloudflare_stream_url(cloudflare_uid)
+            session['has_cloudflare_stream'] = True
+        else:
+            session['has_cloudflare_stream'] = False
         
-        if session.get('gridfs_analytics_id'):
-            session['gridfs_analytics_id'] = str(session['gridfs_analytics_id'])
-            try:
-                analytics_file = fs.get(ObjectId(session['gridfs_analytics_id']))
-                session['analytics_size'] = analytics_file.length
-                session['analytics_upload_date'] = analytics_file.upload_date.isoformat()
-                session['analytics_content_type'] = analytics_file.content_type
-            except:
-                session['analytics_size'] = 0
-                session['analytics_upload_date'] = None
-                session['analytics_content_type'] = None
+        # Convert ObjectIds to strings
+        session = convert_objectids_to_strings(session)
         
         return jsonify(session)
         
     except Exception as e:
         print(f"❌ Error getting session: {e}")
-        return jsonify({
-            "error": "Failed to retrieve session",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/downloadVideo/<session_id>', methods=['GET'])
-def download_video(session_id):
-    """Download/stream video from MongoDB GridFS with range support"""
-    try:
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        video_id = session.get('gridfs_video_id')
-        if not video_id:
-            return jsonify({"error": "Video not found in session"}), 404
-        
-        # Get video file info first
-        video_info = video_processor.get_video_info_from_gridfs(video_id)
-        if not video_info:
-            return jsonify({"error": "Failed to retrieve video info from database"}), 500
-        
-        filename = video_info['filename'] or f"video_{session_id}.mp4"
-        file_size = video_info['length']
-        content_type = video_info['content_type'] or 'video/mp4'
-        
-        # Check for Range header
-        range_header = request.headers.get('Range')
-        start, end = parse_range_header(range_header, file_size)
-        
-        # Check if this is a range request
-        is_range_request = range_header is not None
-        
-        if is_range_request:
-            # Handle range request (HTTP 206 Partial Content)
-            content_length = end - start + 1
-            
-            # Stream the video data
-            stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
-                video_id, start, end
-            )
-            
-            if stream_generator is None:
-                return jsonify({"error": "Failed to stream video from database"}), 500
-            
-            response = Response(
-                stream_generator,
-                status=206,  # Partial Content
-                mimetype=content_type,
-                headers={
-                    'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    'Content-Length': str(content_length),
-                    'Accept-Ranges': 'bytes',
-                    'Content-Disposition': f'attachment; filename="{filename}"'
-                }
-            )
-        else:
-            # Handle full file request
-            # For large files, still use streaming to avoid memory issues
-            if file_size > 50 * 1024 * 1024:  # 50MB threshold
-                # Stream large files
-                stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
-                    video_id, 0, file_size - 1
-                )
-                
-                if stream_generator is None:
-                    return jsonify({"error": "Failed to stream video from database"}), 500
-                
-                response = Response(
-                    stream_generator,
-                    mimetype=content_type,
-                    headers={
-                        'Content-Length': str(file_size),
-                        'Accept-Ranges': 'bytes',
-                        'Content-Disposition': f'attachment; filename="{filename}"'
-                    }
-                )
-            else:
-                # Load small files into memory
-                video_data = video_processor.get_video_from_gridfs(video_id)
-                if not video_data:
-                    return jsonify({"error": "Failed to retrieve video from database"}), 500
-                
-                response = Response(
-                    video_data,
-                    mimetype=content_type,
-                    headers={
-                        'Content-Length': str(len(video_data)),
-                        'Accept-Ranges': 'bytes',
-                        'Content-Disposition': f'attachment; filename="{filename}"'
-                    }
-                )
-        
-        return response
-        
-    except Exception as e:
-        print(f"❌ Error downloading video: {e}")
-        return jsonify({
-            "error": "Failed to download video",
-            "details": str(e)
-        }), 500
-
-@app.route('/streamVideo/<session_id>', methods=['GET'])
-def stream_video(session_id):
-    """Stream video with progress tracking and chunked transfer encoding"""
-    try:
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        video_id = session.get('gridfs_video_id')
-        if not video_id:
-            return jsonify({"error": "Video not found in session"}), 404
-        
-        # Get video file info
-        video_info = video_processor.get_video_info_from_gridfs(video_id)
-        if not video_info:
-            return jsonify({"error": "Failed to retrieve video info from database"}), 500
-        
-        filename = video_info['filename'] or f"video_{session_id}.mp4"
-        file_size = video_info['length']
-        content_type = video_info['content_type'] or 'video/mp4'
-        
-        # Check for Range header
-        range_header = request.headers.get('Range')
-        start, end = parse_range_header(range_header, file_size)
-        
-        # Stream the video data
-        stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
-            video_id, start, end
-        )
-        
-        if stream_generator is None:
-            return jsonify({"error": "Failed to stream video from database"}), 500
-        
-        # Create streaming response
-        response = Response(
-            stream_generator,
-            status=206 if range_header else 200,
-            mimetype=content_type,
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Accept-Ranges': 'bytes',
-                'Transfer-Encoding': 'chunked'
-            }
-        )
-        
-        # Add range headers if this is a range request
-        if range_header:
-            response.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-            response.headers['Content-Length'] = str(end - start + 1)
-        
-        return response
-        
-    except Exception as e:
-        print(f"❌ Error streaming video: {e}")
-        return jsonify({
-            "error": "Failed to stream video",
-            "details": str(e)
-        }), 500
-
-@app.route('/downloadVideo', methods=['GET'])
-def download_video_by_filename():
-    """Download video by filename (frontend compatibility)"""
+# Sync existing GridFS video to Cloudflare Stream
+@app.route('/stream/sync', methods=['POST'])
+def sync_video_to_stream():
+    """Sync an existing GridFS video to Cloudflare Stream"""
     try:
         video_filename = request.args.get('video_filename')
         if not video_filename:
             return jsonify({"error": "video_filename parameter is required"}), 400
         
-        # Find session by video filename
+        # Find session by filename
         session = sessions.get_session_by_video_filename(video_filename)
         if not session:
-            return jsonify({"error": "Video not found"}), 404
+            return jsonify({"error": "Session not found"}), 404
         
-        video_id = session.get('gridfs_video_id')
-        if not video_id:
-            return jsonify({"error": "Video not found in session"}), 404
+        # Check if already synced to Cloudflare Stream
+        if session.get('meta', {}).get('cloudflare_uid'):
+            return jsonify({
+                "message": "Video already synced to Cloudflare Stream",
+                "cloudflare_uid": session['meta']['cloudflare_uid']
+            })
         
-        # Get video file info first
-        video_info = video_processor.get_video_info_from_gridfs(video_id)
-        if not video_info:
-            return jsonify({"error": "Failed to retrieve video info from database"}), 500
+        # Get video from GridFS
+        if not session.get('gridfs_video_id'):
+            return jsonify({"error": "No GridFS video ID found"}), 404
         
-        filename = video_info['filename'] or video_filename
-        file_size = video_info['length']
-        content_type = video_info['content_type'] or 'video/mp4'
+        video_id = session['gridfs_video_id']
+        video_file = fs.get(ObjectId(video_id))
+        if not video_file:
+            return jsonify({"error": "Video not found in GridFS"}), 404
         
-        # Check for Range header
-        range_header = request.headers.get('Range')
-        start, end = parse_range_header(range_header, file_size)
+        # Save GridFS video to temporary file
+        temp_path = os.path.join(TEMP_DIR, f"sync_{int(time.time())}_{video_filename}")
+        with open(temp_path, 'wb') as f:
+            f.write(video_file.read())
         
-        # Check if this is a range request
-        is_range_request = range_header is not None
-        
-        if is_range_request:
-            # Handle range request (HTTP 206 Partial Content)
-            content_length = end - start + 1
+        try:
+            # Prepare metadata
+            metadata = {
+                "name": video_filename,
+                "athlete_name": session.get('athlete_name', 'Unknown'),
+                "event": session.get('event', 'Unknown'),
+                "session_id": str(session['_id']),
+                "sync_source": "gridfs"
+            }
             
-            # Stream the video data
-            stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
-                video_id, start, end
-            )
+            # Upload to Cloudflare Stream
+            cloudflare_video = upload_to_cloudflare_stream(temp_path, metadata)
             
-            if stream_generator is None:
-                return jsonify({"error": "Failed to stream video from database"}), 500
+            if not cloudflare_video:
+                return jsonify({"error": "Failed to upload video to Cloudflare Stream"}), 500
             
-            response = Response(
-                stream_generator,
-                status=206,  # Partial Content
-                mimetype=content_type,
-                headers={
-                    'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    'Content-Length': str(content_length),
-                    'Accept-Ranges': 'bytes',
-                    'Content-Disposition': f'attachment; filename="{filename}"'
+            # Get streaming URL
+            stream_url = get_cloudflare_stream_url(cloudflare_video.get('uid'))
+            
+            # Update session with Cloudflare Stream info
+            update_data = {
+                "meta.cloudflare_stream_id": cloudflare_video.get('uid'),
+                "meta.cloudflare_uid": cloudflare_video.get('uid'),
+                "meta.cloudflare_stream_url": stream_url,
+                "meta.sync_timestamp": datetime.now().isoformat(),
+                "processed_video_url": stream_url
+            }
+            
+            sessions.update_session(session_id, update_data)
+            
+            print(f"✅ Video synced to Cloudflare Stream: {cloudflare_video.get('uid')}")
+            
+            return jsonify({
+                "success": True,
+                "message": "Video synced to Cloudflare Stream successfully",
+                "session_id": session_id,
+                "video": {
+                    "id": cloudflare_video.get('uid'),
+                    "uid": cloudflare_video.get('uid'),
+                    "filename": video_filename,
+                    "size": cloudflare_video.get('size'),
+                    "duration": cloudflare_video.get('duration'),
+                    "ready_to_stream": cloudflare_video.get('readyToStream', False),
+                    "stream_url": stream_url,
+                    "thumbnail": cloudflare_video.get('thumbnail'),
+                    "created": cloudflare_video.get('created')
                 }
-            )
-        else:
-            # Handle full file request
-            # For large files, still use streaming to avoid memory issues
-            if file_size > 50 * 1024 * 1024:  # 50MB threshold
-                # Stream large files
-                stream_generator, total_size, stream_start, stream_end = video_processor.stream_video_from_gridfs(
-                    video_id, 0, file_size - 1
-                )
+            })
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
                 
-                if stream_generator is None:
-                    return jsonify({"error": "Failed to stream video from database"}), 500
-                
-                response = Response(
-                    stream_generator,
-                    mimetype=content_type,
-                    headers={
-                        'Content-Length': str(file_size),
-                        'Accept-Ranges': 'bytes',
-                        'Content-Disposition': f'attachment; filename="{filename}"'
-                    }
-                )
-            else:
-                # Load small files into memory
-                video_data = video_processor.get_video_from_gridfs(video_id)
-                if not video_data:
-                    return jsonify({"error": "Failed to retrieve video from database"}), 500
-                
-                response = Response(
-                    video_data,
-                    mimetype=content_type,
-                    headers={
-                        'Content-Length': str(len(video_data)),
-                        'Accept-Ranges': 'bytes',
-                        'Content-Disposition': f'attachment; filename="{filename}"'
-                    }
-                )
-        
-        return response
-        
     except Exception as e:
-        print(f"❌ Error downloading video by filename: {e}")
-        return jsonify({
-            "error": "Failed to download video",
-            "details": str(e)
-        }), 500
+        print(f"❌ Error syncing video to stream: {e}")
+        return jsonify({"error": str(e)}), 500
 
+# Legacy endpoints for compatibility
 @app.route('/getProcessedVideos', methods=['GET'])
 def get_processed_videos():
-    """Get list of all sessions (uploaded and processed videos)"""
+    """Get processed videos (legacy endpoint)"""
     try:
-        # Get all sessions
         sessions_list = sessions.get_all_sessions()
-        
         processed_videos = []
+        
         for session in sessions_list:
-            if session.get('gridfs_video_id'):
-                try:
-                    video_info = video_processor.get_video_info_from_gridfs(session['gridfs_video_id'])
-                    if video_info:
-                        # Determine session status
-                        status = session.get('status', 'unknown')
-                        processing_status = session.get('processing_status', 'unknown')
-                        has_analytics = session.get('gridfs_analytics_id') is not None
-                        
-                        # Determine if this is a completed analysis or just uploaded
-                        is_completed = (status == 'completed' and has_analytics)
-                        is_uploaded = (status == 'uploaded' or processing_status == 'analysis_failed')
-                        
-                        processed_videos.append({
-                            'session_id': str(session['_id']),
-                            'original_filename': session.get('original_filename', 'Unknown'),
-                            'processed_filename': session.get('processed_video_filename', video_info['filename']),
-                            'file_size_mb': round(video_info['length'] / (1024 * 1024), 2),
-                            'analysis_type': 'pose_detection',
-                            'has_analytics': has_analytics,
-                            'status': status,
-                            'processing_status': processing_status,
-                            'is_completed': is_completed,
-                            'is_uploaded': is_uploaded,
-                            'athlete_name': session.get('athlete_name', 'Unknown Athlete'),
-                            'event': session.get('event', 'Unknown Event'),
-                            'created_at': session.get('created_at', ''),
-                            'notes': session.get('notes', '')
-                        })
-                except Exception as e:
-                    print(f"❌ Error getting video info for session {session['_id']}: {e}")
-                    continue
-        
-        return jsonify({
-            "success": True,
-            "processed_videos": processed_videos
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to retrieve processed videos",
-            "details": str(e)
-        }), 500
-
-@app.route('/getStatistics', methods=['GET'])
-def get_statistics():
-    """Get statistics for a video (frontend compatibility)"""
-    try:
-        video_filename = request.args.get('video_filename')
-        if not video_filename:
-            return jsonify({"error": "video_filename parameter is required"}), 400
-        
-        # Find session by video filename
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            return jsonify({"error": "Video not found"}), 404
-        
-        # Get analytics if available
-        analytics_data = None
-        if session.get('gridfs_analytics_id'):
-            analytics_data = video_processor.get_analytics_from_gridfs(session['gridfs_analytics_id'])
-        
-        # Return basic statistics
-        stats = {
-            "success": True,
-            "video_filename": video_filename,
-            "total_frames": session.get('total_frames', 0),
-            "fps": session.get('fps', 30),
-            "duration": session.get('duration', '00:00'),
-            "motion_iq": session.get('motion_iq', 0.0),
-            "acl_risk": session.get('acl_risk', 0.0),
-            "precision": session.get('precision', 0.0),
-            "power": session.get('power', 0.0),
-            "tumbling_percentage": session.get('tumbling_percentage', 0.0),
-            "has_analytics": analytics_data is not None
-        }
-        
-        return jsonify(stats)
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to retrieve statistics",
-            "details": str(e)
-        }), 500
-
-@app.route('/getSummaryStatistics', methods=['GET'])
-def get_summary_statistics():
-    """Get summary statistics for all videos (frontend compatibility)"""
-    try:
-        # Get all sessions
-        sessions_list = sessions.get_all_sessions()
-        
-        total_videos = len([s for s in sessions_list if s.get('gridfs_video_id')])
-        total_frames = sum(s.get('total_frames', 0) for s in sessions_list)
-        
-        # Calculate average metrics
-        acl_risks = [s.get('acl_risk', 0.0) for s in sessions_list if s.get('acl_risk') is not None]
-        average_acl_risk = sum(acl_risks) / len(acl_risks) if acl_risks else 0.0
-        
-        # Risk distribution
-        risk_distribution = {'low': 0, 'moderate': 0, 'high': 0}
-        for risk in acl_risks:
-            if risk < 0.3:
-                risk_distribution['low'] += 1
-            elif risk < 0.7:
-                risk_distribution['moderate'] += 1
-            else:
-                risk_distribution['high'] += 1
-        
-        # Calculate other metrics
-        motion_iqs = [s.get('motion_iq', 0.0) for s in sessions_list if s.get('motion_iq') is not None]
-        precisions = [s.get('precision', 0.0) for s in sessions_list if s.get('precision') is not None]
-        powers = [s.get('power', 0.0) for s in sessions_list if s.get('power') is not None]
-        
-        summary = {
-            "success": True,
-            "total_videos": total_videos,
-            "total_frames": total_frames,
-            "average_acl_risk": average_acl_risk,
-            "risk_distribution": risk_distribution,
-            "top_metrics": {
-                "average_elevation_angle": sum(motion_iqs) / len(motion_iqs) if motion_iqs else 0.0,
-                "average_flight_time": sum(precisions) / len(precisions) if precisions else 0.0,
-                "average_landing_quality": sum(powers) / len(powers) if powers else 0.0
-            }
-        }
-        
-        return jsonify(summary)
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to retrieve summary statistics",
-            "details": str(e)
-        }), 500
-
-@app.route('/analyzeVideoPerFrame', methods=['POST'])
-def analyze_video_per_frame():
-    """Analyze video per frame (frontend compatibility)"""
-    try:
-        data = request.get_json()
-        video_filename = data.get('video_filename')
-        
-        if not video_filename:
-            return jsonify({"error": "video_filename is required"}), 400
-        
-        # Find session by video filename
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            return jsonify({"error": "Video not found"}), 404
-        
-        # Generate a job ID
-        job_id = f"per_frame_{session['_id']}_{int(time.time())}"
-        
-        # For now, return success with job ID
-        # In a real implementation, this would start background processing
-        return jsonify({
-            "success": True,
-            "job_id": job_id,
-            "message": "Per-frame analysis job started",
-            "video_filename": video_filename
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to start per-frame analysis",
-            "details": str(e)
-        }), 500
-
-@app.route('/cancelAnalysis', methods=['POST'])
-def cancel_analysis():
-    """Cancel an ongoing analysis"""
-    try:
-        data = request.get_json()
-        session_id = data.get('session_id')
-        video_filename = data.get('video_filename')
-        
-        if not session_id and not video_filename:
-            return jsonify({"error": "session_id or video_filename is required"}), 400
-        
-        # Find the session
-        session = None
-        if session_id:
-            session = sessions.get_session(session_id)
-        elif video_filename:
-            session = sessions.get_session_by_video_filename(video_filename)
-        
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        # Check if analysis is currently running
-        current_status = session.get('status', 'unknown')
-        processing_status = session.get('processing_status', 'unknown')
-        
-        if current_status not in ['processing', 'analyzing'] and processing_status not in ['analyzing', 'processing']:
-            return jsonify({
-                "error": "No analysis is currently running for this session",
-                "current_status": current_status,
-                "processing_status": processing_status
-            }), 400
-        
-        # Update session to cancelled status
-        sessions.update_session(session['_id'], {
-            "status": "cancelled",
-            "processing_status": "cancelled",
-            "notes": f"Analysis cancelled by user: {session.get('original_filename', 'Unknown')}",
-            "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-        })
-        
-        print(f"🛑 Analysis cancelled for session {session['_id']}: {session.get('original_filename')}")
-        
-        return jsonify({
-            "success": True,
-            "message": "Analysis cancelled successfully",
-            "session_id": str(session['_id']),
-            "video_filename": session.get('original_filename')
-        })
-        
-    except Exception as e:
-        print(f"❌ Error cancelling analysis: {e}")
-        return jsonify({
-            "error": "Failed to cancel analysis",
-            "details": str(e)
-        }), 500
-
-@app.route('/getJobStatus', methods=['GET'])
-def get_job_status():
-    """Get job status (frontend compatibility)"""
-    try:
-        job_id = request.args.get('job_id')
-        session_id = request.args.get('session_id')
-        
-        if not job_id and not session_id:
-            return jsonify({"error": "job_id or session_id parameter is required"}), 400
-        
-        # If we have a job_id, try to find the session by job_id
-        if job_id:
-            # Try to find session by job_id
-            session = sessions.get_session_by_job_id(job_id)
-            if not session:
-                # Fallback: extract session ID from job ID (format: enhanced_analysis_{timestamp}_{base_name})
-                if job_id.startswith("enhanced_analysis_"):
-                    # For enhanced analysis jobs, we need to find by job_id field
-                    session = sessions.get_session_by_job_id(job_id)
-                elif job_id.startswith("per_frame_"):
-                    # Extract session ID from job ID (format: per_frame_{session_id}_{timestamp})
-                    parts = job_id.split("_")
-                    if len(parts) >= 3:
-                        session_id = "_".join(parts[2:-1])  # Everything between "per_frame" and the timestamp
-                        session = sessions.get_session(session_id)
-                else:
-                    # If it's not a known format, treat it as a direct session ID
-                    session = sessions.get_session(job_id)
-        else:
-            # Use session_id directly
-            session = sessions.get_session(session_id)
-        
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        # Return the session data in the expected format
-        return jsonify({
-            "success": True,
-            "job_status": {
-                "status": session.get("status", "unknown"),
-                "video_filename": session.get("original_filename", "unknown"),
-                "output_video": session.get("processed_video_filename", session.get("original_filename", "unknown")),
-                "analytics_file": session.get("analytics_filename", "unknown"),
-                "timestamp": session.get("created_at", datetime.now().isoformat()),
-                "result": {
-                    "total_frames": session.get("total_frames", 0),
-                    "fps": session.get("fps", 30),
-                    "processing_status": session.get("processing_status", "unknown"),
-                    "processing_progress": session.get("processing_progress", 0.0)
+            if session.get('processed_video_filename'):
+                video_info = {
+                    "filename": session['processed_video_filename'],
+                    "athlete_name": session.get('athlete_name', 'Unknown'),
+                    "event": session.get('event', 'Unknown'),
+                    "date": session.get('date', ''),
+                    "duration": session.get('duration', ''),
+                    "has_cloudflare_stream": bool(session.get('meta', {}).get('cloudflare_uid')),
+                    "cloudflare_stream_url": get_cloudflare_stream_url(session['meta']['cloudflare_uid']) if session.get('meta', {}).get('cloudflare_uid') else None
                 }
-            }
+                processed_videos.append(video_info)
+        
+        return jsonify({
+            "processed_videos": processed_videos,
+            "count": len(processed_videos)
         })
         
     except Exception as e:
-        return jsonify({
-            "error": "Failed to get job status",
-            "details": str(e)
-        }), 500
+        print(f"❌ Error getting processed videos: {e}")
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/getAnalytics/<session_id>', methods=['GET'])
-def get_analytics(session_id):
-    """Get analytics data from MongoDB GridFS"""
-    try:
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        analytics_id = session.get('gridfs_analytics_id')
-        if not analytics_id:
-            return jsonify({"error": "Analytics not found in session"}), 404
-        
-        # Get analytics data from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        if not analytics_data:
-            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
-        
-        return jsonify({
-            "session_id": session_id,
-            "analytics": analytics_data,
-            "metadata": {
-                "filename": session.get('analytics_filename'),
-                "total_frames": len(analytics_data) if isinstance(analytics_data, list) else 0,
-                "timestamp": datetime.now().isoformat()
-            }
-        })
-        
-    except Exception as e:
-        print(f"❌ Error getting analytics: {e}")
-        return jsonify({
-            "error": "Failed to retrieve analytics",
-            "details": str(e)
-        }), 500
-
-@app.route('/debugSession/<video_filename>', methods=['GET'])
-def debug_session_lookup(video_filename):
-    """Debug endpoint to check session and analytics data"""
-    try:
-        print(f"🔍 DEBUG: Looking for session with video filename: {video_filename}")
-        
-        # Check all sessions in database
-        all_sessions = list(sessions.collection.find({}, {
-            "original_filename": 1, 
-            "processed_video_filename": 1, 
-            "gridfs_analytics_id": 1,
-            "gridfs_video_id": 1,
-            "_id": 1,
-            "status": 1,
-            "created_at": 1
-        }))
-        
-        print(f"📋 Total sessions in database: {len(all_sessions)}")
-        
-        # Try different lookup methods
-        session_by_processed = sessions.get_session_by_video_filename(video_filename)
-        
-        # Extract original filename if it's a processed filename
-        original_filename = None
-        if video_filename.startswith('h264_analyzed_temp_'):
-            parts = video_filename.split('_')
-            if len(parts) >= 5:
-                original_parts = parts[3:-1]
-                original_filename = '_'.join(original_parts) + '.mp4'
-        
-        session_by_original = None
-        if original_filename:
-            session_by_original = sessions.get_session_by_video_filename(original_filename)
-        
-        # Check GridFS analytics
-        analytics_data = None
-        if session_by_processed and session_by_processed.get('gridfs_analytics_id'):
-            analytics_data = video_processor.get_analytics_from_gridfs(session_by_processed['gridfs_analytics_id'])
-        elif session_by_original and session_by_original.get('gridfs_analytics_id'):
-            analytics_data = video_processor.get_analytics_from_gridfs(session_by_original['gridfs_analytics_id'])
-        
-        # Convert ObjectId to string for JSON serialization
-        def convert_objectid(obj):
-            if hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
-                if isinstance(obj, dict):
-                    return {k: convert_objectid(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [convert_objectid(item) for item in obj]
-            elif hasattr(obj, '__str__') and 'ObjectId' in str(type(obj)):
-                return str(obj)
-            return obj
-        
-        return jsonify({
-            "video_filename": video_filename,
-            "original_filename": original_filename,
-            "total_sessions": len(all_sessions),
-            "session_by_processed_filename": convert_objectid(session_by_processed),
-            "session_by_original_filename": convert_objectid(session_by_original),
-            "analytics_data_exists": analytics_data is not None,
-            "analytics_data_type": type(analytics_data).__name__ if analytics_data else None,
-            "analytics_data_length": len(analytics_data) if isinstance(analytics_data, list) else "N/A",
-            "all_sessions": [
-                {
-                    "id": str(s.get("_id", "")),
-                    "original_filename": s.get("original_filename", ""),
-                    "processed_video_filename": s.get("processed_video_filename", ""),
-                    "has_analytics_id": bool(s.get("gridfs_analytics_id")),
-                    "analytics_id": str(s.get("gridfs_analytics_id", "")) if s.get("gridfs_analytics_id") else None,
-                    "status": s.get("status", ""),
-                    "created_at": s.get("created_at", "")
-                } for s in all_sessions
-            ]
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Debug failed",
-            "details": str(e)
-        }), 500
-
-@app.route('/debugAnalytics/<analytics_id>', methods=['GET'])
-def debug_analytics_retrieval(analytics_id):
-    """Debug endpoint to test analytics retrieval from GridFS"""
-    try:
-        print(f"🔍 DEBUG: Retrieving analytics with ID: {analytics_id}")
-        
-        # Try to get analytics from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        
-        if analytics_data:
-            return jsonify({
-                "analytics_id": analytics_id,
-                "data_exists": True,
-                "data_type": type(analytics_data).__name__,
-                "data_length": len(analytics_data) if isinstance(analytics_data, list) else "N/A",
-                "sample_data": analytics_data[:2] if isinstance(analytics_data, list) and len(analytics_data) > 0 else analytics_data,
-                "first_frame_keys": list(analytics_data[0].keys()) if isinstance(analytics_data, list) and len(analytics_data) > 0 and isinstance(analytics_data[0], dict) else "N/A"
-            })
-        else:
-            return jsonify({
-                "analytics_id": analytics_id,
-                "data_exists": False,
-                "error": "No analytics data found"
-            })
-            
-    except Exception as e:
-        return jsonify({
-            "analytics_id": analytics_id,
-            "error": "Failed to retrieve analytics",
-            "details": str(e)
-        }), 500
-
-@app.route('/fixAnalytics/<session_id>', methods=['POST'])
-def fix_missing_analytics(session_id):
-    """Fix missing analytics for a session by uploading existing analytics file"""
-    try:
-        # Get the session
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        original_filename = session.get('original_filename')
-        if not original_filename:
-            return jsonify({"error": "No original filename in session"}), 400
-        
-        # Look for existing analytics file
-        analytics_filename = f"fixed_analytics_{original_filename}.json"
-        analytics_path = os.path.join(".", analytics_filename)
-        
-        if not os.path.exists(analytics_path):
-            analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
-        
-        if not os.path.exists(analytics_path):
-            return jsonify({"error": f"Analytics file not found: {analytics_filename}"}), 404
-        
-        print(f"🔧 Fixing analytics for session {session_id}")
-        print(f"📊 Found analytics file: {analytics_path}")
-        
-        # Upload analytics to GridFS
-        with open(analytics_path, 'rb') as analytics_file:
-            analytics_id = video_processor.fs.put(
-                analytics_file,
-                filename=analytics_filename,
-                metadata={
-                    "video_filename": original_filename,
-                    "analysis_type": "per_frame_analytics",
-                    "upload_timestamp": datetime.now().isoformat(),
-                    "fix_upload": True
-                },
-                contentType='application/json'
-            )
-        
-        # Update session with analytics ID
-        sessions.update_session(session_id, {
-            "gridfs_analytics_id": str(analytics_id),
-            "analytics_filename": analytics_filename,
-            "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}"
-        })
-        
-        print(f"✅ Analytics uploaded to GridFS: {analytics_id}")
-        
-        return jsonify({
-            "success": True,
-            "message": "Analytics fixed and uploaded to GridFS",
-            "analytics_id": str(analytics_id),
-            "analytics_filename": analytics_filename
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to fix analytics",
-            "details": str(e)
-        }), 500
-
-@app.route('/getPerFrameStatistics', methods=['GET'])
-def get_per_frame_statistics_by_filename():
-    """Get per-frame statistics by video filename (frontend compatibility)"""
-    try:
-        video_filename = request.args.get('video_filename')
-        if not video_filename:
-            return jsonify({"error": "video_filename parameter is required"}), 400
-        
-        # Find session by video filename
-        print(f"🔍 Looking for session with video filename: {video_filename}")
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            print(f"❌ No session found for video filename: {video_filename}")
-            
-            # Try to extract original filename from processed filename
-            if video_filename.startswith('h264_analyzed_temp_') or video_filename.startswith('enhanced_analyzed_temp_'):
-                # Extract original filename from processed filename
-                # Format: enhanced_analyzed_temp_{timestamp}_{original_filename}_{timestamp}.mp4
-                # Format: h264_analyzed_temp_{timestamp}_{original_filename}_{timestamp}.mp4
-                parts = video_filename.split('_')
-                if len(parts) >= 5:
-                    # Find the original filename part (skip timestamp parts)
-                    original_parts = parts[3:-1]  # Skip 'enhanced/h264', 'analyzed', 'temp', first timestamp, and last timestamp
-                    original_filename = '_'.join(original_parts) + '.mp4'
-                    print(f"🔍 Trying to find session with extracted original filename: {original_filename}")
-                    session = sessions.get_session_by_video_filename(original_filename)
-            
-            if not session:
-                # Try to find any sessions with similar filenames for debugging
-                try:
-                    all_sessions = list(sessions.collection.find({}, {"original_filename": 1, "processed_video_filename": 1, "_id": 1}))
-                    print(f"📋 Available sessions: {[s.get('processed_video_filename', s.get('original_filename', 'unknown')) for s in all_sessions]}")
-                except Exception as debug_e:
-                    print(f"⚠️ Could not list sessions for debugging: {debug_e}")
-                return jsonify({
-                    "error": "Session not found",
-                    "requested_filename": video_filename,
-                    "message": "No session found for this video filename. Make sure the video has been processed and uploaded to the server."
-                }), 404
-        
-        analytics_id = session.get('gridfs_analytics_id')
-        if not analytics_id:
-            return jsonify({"error": "Analytics not found for this session"}), 404
-        
-        # Get analytics data from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        if not analytics_data:
-            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
-        
-        # Calculate actual frame count and FPS from analytics data
-        actual_frame_data = analytics_data.get('frame_data', []) if isinstance(analytics_data, dict) else analytics_data
-        actual_frame_count = len(actual_frame_data) if actual_frame_data else 0
-        
-        # Calculate FPS from frame data if available
-        calculated_fps = 30.0  # Default FPS
-        if actual_frame_data and len(actual_frame_data) > 1:
-            # Try to calculate FPS from timestamps
-            first_frame = actual_frame_data[0]
-            last_frame = actual_frame_data[-1]
-            if 'metrics' in first_frame and 'metrics' in last_frame:
-                first_time = first_frame['metrics'].get('timestamp', 0)
-                last_time = last_frame['metrics'].get('timestamp', 0)
-                if last_time > first_time:
-                    time_diff = last_time - first_time
-                    calculated_fps = (len(actual_frame_data) - 1) / time_diff if time_diff > 0 else 30.0
-        
-        # Format response to match frontend expectations
-        response_data = {
-            "success": True,
-            "video_filename": video_filename,
-            "total_frames": actual_frame_count,
-            "fps": calculated_fps,
-            "frames_processed": actual_frame_count,
-            "processing_time": "00:00:01",
-            "enhanced_analytics": True,
-            "frame_data": actual_frame_data,
-            "enhanced_statistics": analytics_data.get('enhanced_statistics', {}) if isinstance(analytics_data, dict) else {}
-        }
-        
-        return jsonify(response_data)
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to retrieve per-frame statistics",
-            "details": str(e)
-        }), 500
-
-@app.route('/getPerFrameStatistics/<session_id>', methods=['GET'])
-def get_per_frame_statistics(session_id):
-    """Get per-frame statistics from MongoDB"""
-    try:
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        analytics_id = session.get('gridfs_analytics_id')
-        if not analytics_id:
-            return jsonify({"error": "Analytics not found in session"}), 404
-        
-        # Get analytics data from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        if not analytics_data:
-            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
-        
-        # Calculate statistics
-        if isinstance(analytics_data, list) and len(analytics_data) > 0:
-            # Calculate detailed statistics
-            stats = calculate_detailed_statistics(analytics_data)
-            
-            return jsonify({
-                "session_id": session_id,
-                "video_filename": session.get('original_filename'),
-                "statistics": stats,
-                "frame_count": len(analytics_data),
-                "timestamp": datetime.now().isoformat()
-            })
-        else:
-            return jsonify({
-                "session_id": session_id,
-                "error": "No frame data available",
-                "timestamp": datetime.now().isoformat()
-            })
-        
-    except Exception as e:
-        print(f"❌ Error getting per-frame statistics: {e}")
-        return jsonify({
-            "error": "Failed to retrieve per-frame statistics",
-            "details": str(e)
-        }), 500
-
-@app.route('/getACLRiskAnalysis', methods=['GET'])
-def get_acl_risk_analysis_by_filename():
-    """Get ACL risk analysis by video filename (frontend compatibility)"""
-    try:
-        video_filename = request.args.get('video_filename')
-        if not video_filename:
-            return jsonify({"error": "video_filename parameter is required"}), 400
-        
-        # Find session by video filename
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        analytics_id = session.get('gridfs_analytics_id')
-        if not analytics_id:
-            return jsonify({"error": "Analytics not found for this session"}), 404
-        
-        # Get analytics data from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        if not analytics_data:
-            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
-        
-        # Calculate ACL risk factors from session data
-        acl_risk = session.get('acl_risk', 0.0)
-        
-        # Determine risk level
-        if acl_risk < 0.3:
-            risk_level = 'LOW'
-        elif acl_risk < 0.7:
-            risk_level = 'MODERATE'
-        else:
-            risk_level = 'HIGH'
-        
-        # Format response to match frontend expectations
-        response_data = {
-            "success": True,
-            "video_filename": video_filename,
-            "risk_factors": {
-                "knee_angle_risk": acl_risk * 0.3,
-                "knee_valgus_risk": acl_risk * 0.4,
-                "landing_mechanics_risk": acl_risk * 0.3,
-                "overall_acl_risk": acl_risk,
-                "risk_level": risk_level
-            },
-            "recommendations": [
-                "Focus on proper landing mechanics",
-                "Strengthen knee stabilizing muscles",
-                "Practice controlled landings",
-                "Work on balance and proprioception"
-            ],
-            "frame_analysis": analytics_data.get('frame_data', []) if isinstance(analytics_data, dict) else analytics_data
-        }
-        
-        return jsonify(response_data)
-        
-    except Exception as e:
-        return jsonify({
-            "error": "Failed to retrieve ACL risk analysis",
-            "details": str(e)
-        }), 500
-
-@app.route('/getACLRiskAnalysis/<session_id>', methods=['GET'])
-def get_acl_risk_analysis(session_id):
-    """Get ACL risk analysis from MongoDB"""
-    try:
-        session = sessions.get_session(session_id)
-        if not session:
-            return jsonify({"error": "Session not found"}), 404
-        
-        analytics_id = session.get('gridfs_analytics_id')
-        if not analytics_id:
-            return jsonify({"error": "Analytics not found in session"}), 404
-        
-        # Get analytics data from GridFS
-        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
-        if not analytics_data:
-            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
-        
-        # Calculate ACL risk analysis
-        if isinstance(analytics_data, list) and len(analytics_data) > 0:
-            acl_analysis = calculate_acl_risk_analysis(analytics_data)
-            
-            return jsonify({
-                "session_id": session_id,
-                "video_filename": session.get('original_filename'),
-                "acl_analysis": acl_analysis,
-                "timestamp": datetime.now().isoformat()
-            })
-        else:
-            return jsonify({
-                "session_id": session_id,
-                "error": "No frame data available for ACL analysis",
-                "timestamp": datetime.now().isoformat()
-            })
-        
-    except Exception as e:
-        print(f"❌ Error getting ACL risk analysis: {e}")
-        return jsonify({
-            "error": "Failed to retrieve ACL risk analysis",
-            "details": str(e)
-        }), 500
-
+# Regular video upload endpoint (with Cloudflare Stream integration)
 @app.route('/uploadVideo', methods=['POST'])
 def upload_video():
-    """Upload video to MongoDB GridFS"""
+    """Upload video to Cloudflare Stream only (no GridFS)"""
     try:
         if 'video' not in request.files:
             return jsonify({"error": "No video file provided"}), 400
@@ -1558,184 +1257,277 @@ def upload_video():
         athlete_name = request.form.get('athlete_name', 'Unknown Athlete')
         event = request.form.get('event', 'Floor Exercise')
         session_name = request.form.get('session_name', f'{athlete_name} - {event}')
+        user_id = request.form.get('user_id', 'demo_user')  # Get user_id from form data
         auto_analyze = request.form.get('auto_analyze', 'true').lower() == 'true'
         
-        print(f"📤 Uploading video: {video_file.filename}")
+        print(f"📤 Uploading video to Cloudflare Stream: {video_file.filename}")
         print(f"👤 Athlete: {athlete_name}")
         print(f"🏃 Event: {event}")
         print(f"📝 Session: {session_name}")
         print(f"🔄 Auto-analyze: {auto_analyze}")
         
-        # Upload video to GridFS
-        video_metadata = {
-            "athlete_name": athlete_name,
-            "event": event,
-            "session_name": session_name,
-            "original_filename": video_file.filename,
-            "upload_timestamp": datetime.now().isoformat()
-        }
+        # Upload video to Cloudflare Stream
+        cloudflare_info = None
+        try:
+            # Save file temporarily for Cloudflare upload
+            temp_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{video_file.filename}")
+            video_file.seek(0)  # Reset file pointer
+            video_file.save(temp_path)
+            
+            # Upload to Cloudflare Stream
+            metadata = {
+                "name": video_file.filename,
+                "athlete_name": athlete_name,
+                "event": event,
+                "session_name": session_name,
+                "upload_source": "gymnastics_api_server_updated2"
+            }
+            
+            cloudflare_video = upload_to_cloudflare_stream(temp_path, metadata)
+            
+            if not cloudflare_video:
+                raise Exception("Failed to upload to Cloudflare Stream")
+            
+            stream_url = get_cloudflare_stream_url(cloudflare_video.get('uid'))
+            
+            cloudflare_info = {
+                "id": cloudflare_video.get('uid'),
+                "uid": cloudflare_video.get('uid'),
+                "stream_url": stream_url,
+                "ready_to_stream": cloudflare_video.get('readyToStream', False),
+                "size": cloudflare_video.get('size'),
+                "duration": cloudflare_video.get('duration')
+            }
+            
+            print(f"✅ Video uploaded to Cloudflare Stream: {cloudflare_video.get('uid')}")
+            
+            # Clean up temp file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+        except Exception as e:
+            print(f"❌ Cloudflare Stream upload failed: {e}")
+            return jsonify({"error": f"Failed to upload to Cloudflare Stream: {str(e)}"}), 500
         
-        video_id = fs.put(
-            video_file,
-            filename=video_file.filename,
-            metadata=video_metadata,
-            contentType='video/mp4'
-        )
-        
-        # Create session record
+        # Create session record with Cloudflare Stream info only
         session_data = {
-            "user_id": "demo_user",
+            "user_id": user_id,  # Use user_id from form data
             "athlete_name": athlete_name,
             "session_name": session_name,
             "event": event,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "duration": "00:00",  # Will be updated after processing
             "original_filename": video_file.filename,
-            "processed_video_filename": video_file.filename,  # Will be updated when processed
-            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={video_file.filename}",
-            "analytics_filename": None,
-            "analytics_url": None,
-            "motion_iq": 0.0,
-            "acl_risk": 0.0,
-            "precision": 0.0,
-            "power": 0.0,
-            "tumbling_percentage": 0.0,
+            "processed_video_filename": video_file.filename,
+            "processed_video_url": stream_url,
             "status": "uploaded",
-            "processing_progress": 0.0,
-            "total_frames": 0,
-            "fps": 0.0,
-            "has_landmarks": False,
-            "landmark_confidence": 0.0,
-            "notes": f"Video uploaded: {video_file.filename}",
-            "coach_notes": "",
-            "highlights": [],
-            "areas_for_improvement": [],
-            "gridfs_video_id": video_id,
-            "gridfs_analytics_id": None,
-            "is_binary_stored": True,
-            "processing_status": "uploaded"
+            "processing_status": "pending",
+            "is_binary_stored": False,  # No GridFS storage
+            "gridfs_video_id": None,  # No GridFS ID
+            "created_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "meta": {
+                "cloudflare_stream_id": cloudflare_video.get('uid'),
+                "cloudflare_uid": cloudflare_video.get('uid'),
+                "upload_source": "cloudflare_stream",
+                "upload_timestamp": datetime.now().isoformat(),
+                "video_size": cloudflare_video.get('size'),
+                "video_duration": cloudflare_video.get('duration'),
+                "ready_to_stream": cloudflare_video.get('readyToStream', False),
+                "stream_url": stream_url,
+                "thumbnail": cloudflare_video.get('thumbnail')
+            }
         }
         
+        # Save session to MongoDB
         session_id = sessions.create_session(session_data)
-        print(f"✅ Session created with ID: {session_id}")
-        print(f"📁 Original filename: {video_file.filename}")
-        print(f"👤 Athlete name: {athlete_name}")
-        print(f"🏃 Event: {event}")
         
-        # Automatically start analysis after successful upload (if enabled)
-        if auto_analyze:
-            try:
-                print(f"🚀 Auto-starting analysis for uploaded video: {video_file.filename}")
-                
-                # Prepare analysis request data with GridFS video ID and session ID
-                analysis_data = {
-                    "video_filename": video_file.filename,
-                    "athlete_name": athlete_name,
-                    "event": event,
-                    "session_name": session_name,
-                    "user_id": "demo_user",
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "gridfs_video_id": str(video_id),  # Add GridFS video ID for direct access
-                    "session_id": session_id  # Add session ID to update existing session
-                }
-                
-                # Call analyzeVideo1 endpoint internally
-                analysis_response = analyze_video_from_gridfs_internal(analysis_data)
-                
-                if analysis_response.get("success"):
-                    print(f"✅ Auto-analysis started successfully for: {video_file.filename}")
-                    # Update session with analysis results
-                    sessions.update_session(session_id, {
-                        "status": "processing",
-                        "processing_status": "analyzing",
-                        "notes": f"Video uploaded and analysis started: {video_file.filename}"
-                    })
-                else:
-                    print(f"⚠️ Auto-analysis failed for: {video_file.filename}, but upload was successful")
-                    # Update session to indicate analysis failed but upload succeeded
-                    sessions.update_session(session_id, {
-                        "status": "uploaded",
-                        "processing_status": "analysis_failed",
-                        "notes": f"Video uploaded but analysis failed: {video_file.filename}"
-                    })
-                    
-            except Exception as analysis_error:
-                print(f"⚠️ Auto-analysis error for {video_file.filename}: {analysis_error}")
-                # Update session to indicate analysis failed but upload succeeded
-                sessions.update_session(session_id, {
-                    "status": "uploaded", 
-                    "processing_status": "analysis_failed",
-                    "notes": f"Video uploaded but analysis failed: {video_file.filename}"
-                })
+        print(f"✅ Session created: {session_id}")
         
-        return jsonify({
+        response_data = {
             "success": True,
+            "message": "Video uploaded successfully to Cloudflare Stream",
             "session_id": session_id,
-            "video_id": str(video_id),
-            "message": "Video uploaded successfully" + (" and analysis started" if auto_analyze else ""),
-            "timestamp": datetime.now().isoformat(),
-            "auto_analysis": auto_analyze
-        })
+            "video_id": cloudflare_video.get('uid'),  # Use Cloudflare UID as video ID
+            "filename": video_file.filename,
+            "size_mb": round(cloudflare_video.get('size', 0) / (1024 * 1024), 2),
+            "gridfs_stored": False,
+            "cloudflare_stored": True,
+            "cloudflare": cloudflare_info
+        }
+        
+        return jsonify(response_data)
         
     except Exception as e:
         print(f"❌ Error uploading video: {e}")
-        return jsonify({
-            "error": "Failed to upload video",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/getVideoList', methods=['GET'])
-def get_video_list():
-    """Get list of videos from MongoDB"""
+# Analytics endpoints (keeping from original server)
+@app.route('/getAnalytics/<analytics_id>', methods=['GET'])
+def get_analytics(analytics_id):
+    """Get analytics data from MongoDB GridFS"""
     try:
-        # Get all sessions with video information
-        sessions_list = sessions.get_all_sessions()
+        print(f"🔍 Getting analytics for ID: {analytics_id}")
         
-        video_list = []
-        for session in sessions_list:
-            if session.get('gridfs_video_id'):
-                try:
-                    video_file = fs.get(ObjectId(session['gridfs_video_id']))
-                    video_list.append({
-                        "session_id": str(session['_id']),
-                        "filename": session.get('original_filename'),
-                        "athlete_name": session.get('athlete_name'),
-                        "event": session.get('event'),
-                        "date": session.get('date'),
-                        "duration": session.get('duration'),
-                        "file_size": video_file.length,
-                        "upload_date": video_file.upload_date.isoformat(),
-                        "status": session.get('status'),
-                        "has_analytics": bool(session.get('gridfs_analytics_id'))
-                    })
-                except Exception as e:
-                    print(f"⚠️  Error getting video info for session {session['_id']}: {e}")
+        # Get analytics data from GridFS
+        analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
+        if not analytics_data:
+            return jsonify({"error": "Failed to retrieve analytics from database"}), 500
+        
+        # Convert timestamps to relative time for video synchronization
+        processed_analytics = convert_timestamps_to_relative(analytics_data)
         
         return jsonify({
-            "videos": video_list,
-            "count": len(video_list),
-            "timestamp": datetime.now().isoformat()
+            "analytics_id": analytics_id,
+            "analytics": processed_analytics,
+            "metadata": {
+                "total_frames": len(processed_analytics) if isinstance(processed_analytics, list) else 
+                               len(processed_analytics.get('frame_data', [])) if isinstance(processed_analytics, dict) else 0,
+                "timestamp": datetime.now().isoformat()
+            }
         })
         
     except Exception as e:
-        print(f"❌ Error getting video list: {e}")
+        print(f"❌ Error getting analytics: {e}")
         return jsonify({
-            "error": "Failed to retrieve video list",
+            "error": "Failed to retrieve analytics",
             "details": str(e)
         }), 500
 
-@app.route('/analyzeVideo', methods=['POST'])
-def analyze_video():
-    """Analyze video and generate analytics overlay, then upload to MongoDB"""
+@app.route('/getPerFrameStatistics', methods=['GET'])
+def get_per_frame_statistics():
+    """Get per-frame statistics by video filename"""
+    try:
+        video_filename = request.args.get('video_filename')
+        if not video_filename:
+            return jsonify({"error": "video_filename parameter is required"}), 400
+        
+        print(f"🔍 Getting per-frame statistics for video: {video_filename}")
+        
+        # Try to find analytics data for this video filename
+        # First, check if we have a session with this video
+        sessions_collection = db_manager.db.sessions
+        session = sessions_collection.find_one({"video_filename": video_filename})
+        
+        if session and session.get('analytics_id'):
+            # Get analytics from GridFS using the analytics_id
+            analytics_id = session['analytics_id']
+            print(f"📊 Found session with analytics_id: {analytics_id}")
+            
+            analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
+            if analytics_data:
+                # Check if the analytics data has the expected structure
+                if isinstance(analytics_data, dict) and 'frame_data' in analytics_data:
+                    # Convert timestamps to relative time for video synchronization
+                    processed_data = convert_timestamps_to_relative(analytics_data)
+                    return jsonify(processed_data)
+                elif isinstance(analytics_data, list):
+                    # Convert list format to expected format and fix timestamps
+                    processed_data = convert_timestamps_to_relative({
+                        "frame_data": analytics_data,
+                        "enhanced_statistics": {},
+                        "analytics_id": str(analytics_id)
+                    })
+                    return jsonify(processed_data)
+                else:
+                    print(f"⚠️ Unexpected analytics data format for {analytics_id}")
+        
+        # If no session found, try to find analytics files in GridFS by filename
+        print(f"🔍 Searching GridFS for analytics files matching: {video_filename}")
+        files_collection = db_manager.db.fs.files
+        
+        # Try different filename patterns
+        search_patterns = [
+            video_filename,
+            video_filename.replace('.mp4', ''),
+            f"fixed_analytics_{video_filename}",
+            f"analytics_{video_filename.replace('.mp4', '')}.json"
+        ]
+        
+        for pattern in search_patterns:
+            print(f"🔍 Searching for pattern: {pattern}")
+            analytics_file = files_collection.find_one({"filename": {"$regex": pattern, "$options": "i"}})
+            
+            if analytics_file:
+                print(f"✅ Found analytics file: {analytics_file['filename']}")
+                analytics_id = analytics_file['_id']
+                
+                analytics_data = video_processor.get_analytics_from_gridfs(analytics_id)
+                if analytics_data:
+                    if isinstance(analytics_data, dict) and 'frame_data' in analytics_data:
+                        # Convert timestamps to relative time for video synchronization
+                        processed_data = convert_timestamps_to_relative(analytics_data)
+                        return jsonify(processed_data)
+                    elif isinstance(analytics_data, list):
+                        # Convert list format to expected format and fix timestamps
+                        processed_data = convert_timestamps_to_relative({
+                            "frame_data": analytics_data,
+                            "enhanced_statistics": {},
+                            "analytics_id": str(analytics_id)
+                        })
+                        return jsonify(processed_data)
+        
+        # If no analytics found, return empty response
+        print(f"❌ No analytics found for video: {video_filename}")
+        return jsonify({
+            "error": f"No analytics found for video: {video_filename}",
+            "frame_data": [],
+            "enhanced_statistics": {}
+        }), 404
+        
+    except Exception as e:
+        print(f"❌ Error getting per-frame statistics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/analyzeVideo1', methods=['POST'])
+def analyze_video_from_cloudflare_or_gridfs():
+    """Analyze video from Cloudflare Stream (priority) or GridFS by downloading it locally first, then processing"""
     try:
         data = request.get_json()
+        
+        # Support both old and new parameter formats
+        session_id = data.get('session_id')
+        cloudflare_stream_id = data.get('cloudflare_stream_id')
         video_filename = data.get('video_filename')
+        
+        # If session_id is provided, use that to find the session
+        if session_id:
+            print(f"🔍 Analyzing video for session: {session_id}")
+            session = sessions.get_session(session_id)
+            if not session:
+                print(f"❌ Session not found: {session_id}")
+                return jsonify({"error": f"Session not found: {session_id}"}), 404
+            
+            print(f"✅ Session found: {session.get('_id')}")
+            print(f"📊 Session meta: {session.get('meta', {})}")
+            
+            # Extract video filename from session
+            video_filename = session.get('processed_video_filename') or session.get('original_filename')
+            if not video_filename:
+                print(f"❌ No video filename found in session")
+                return jsonify({"error": "No video filename found in session"}), 400
+                
+            print(f"🔍 Found video filename in session: {video_filename}")
+        elif not video_filename:
+            return jsonify({"error": "Either session_id or video_filename is required"}), 400
+        
+        # Legacy parameter support
         athlete_name = data.get('athlete_name', 'Unknown Athlete')
         event = data.get('event', 'Floor Exercise')
         session_name = data.get('session_name', f'{athlete_name} - {event}')
+        user_id = data.get('user_id', 'demo_user')
+        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
         
-        if not video_filename:
-            return jsonify({"error": "video_filename is required"}), 400
+        print(f"🔍 Looking for video: {video_filename}")
         
         # Check if Railway MediaPipe server is running
         if not video_processor.check_mediapipe_server():
@@ -1745,607 +1537,99 @@ def analyze_video():
                 "server_url": MEDIAPIPE_SERVER_URL
             }), 503
         
-        # Find the best available video (prioritize H.264)
-        best_video_path, is_h264, original_path = video_processor.find_best_video(video_filename)
-        
-        if not best_video_path:
-            return jsonify({"error": f"Video file not found: {video_filename}"}), 404
-        
-        # Use the best available video for processing
-        video_path = best_video_path
-        print(f"🎬 Processing video: {os.path.basename(video_path)} (H.264: {is_h264})")
-        
-        # Generate unique output name (avoid double h264 prefix)
-        base_name = os.path.splitext(video_filename)[0]
-        # Remove existing h264_ prefix if present to avoid accumulation
-        if base_name.startswith('h264_'):
-            base_name = base_name[5:]  # Remove 'h264_' prefix
-        timestamp = int(time.time())
-        output_name = f"analyzed_temp_{timestamp}_{base_name}_{timestamp}.mp4"
-        
-        # Process video with MediaPipe
-        result = video_processor.process_video_with_analytics(video_path, output_name)
-        
-        if result["success"]:
-            # Upload processed video and analytics to GridFS
-            video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
-                result.get("h264_video", result["output_video"]),
-                result["analytics_file"],
-                {
-                    "athlete_name": athlete_name,
-                    "event": event,
-                    "session_name": session_name,
-                    "original_filename": video_filename,
-                    "processing_timestamp": timestamp
-                }
-            )
-            
-            if video_id:
-                # Create session record
-                session_data = {
-                    "user_id": "demo_user",
-                    "athlete_name": athlete_name,
-                    "session_name": session_name,
-                    "event": event,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "duration": "00:00",  # Will be updated after processing
-                    "original_filename": video_filename,
-                    "processed_video_filename": os.path.basename(result.get("h264_video", result["output_video"])),
-                    "processed_video_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(result.get('h264_video', result['output_video']))}",
-                    "analytics_filename": os.path.basename(result["analytics_file"]) if result["analytics_file"] else None,
-                    "analytics_url": f"http://localhost:5004/getAnalytics/{video_id}" if analytics_id else None,
-                    "motion_iq": 0.0,  # Will be calculated from analytics
-                    "acl_risk": 0.0,   # Will be calculated from analytics
-                    "precision": 0.0,  # Will be calculated from analytics
-                    "power": 0.0,      # Will be calculated from analytics
-                    "tumbling_percentage": 0.0,  # Will be calculated from analytics
-                    "status": "completed",
-                    "processing_progress": 1.0,
-                    "total_frames": 0,  # Will be calculated from analytics
-                    "fps": 0.0,         # Will be calculated from analytics
-                    "has_landmarks": True,
-                    "landmark_confidence": 0.9,
-                    "notes": f"Video analyzed with Railway MediaPipe server: {video_filename}",
-                    "coach_notes": "",
-                    "highlights": [],
-                    "areas_for_improvement": [],
-                    "gridfs_video_id": video_id,
-                    "gridfs_analytics_id": analytics_id,
-                    "is_binary_stored": True,
-                    "processing_status": "completed"
-                }
-                
-                # Calculate analytics if available
-                if analytics_id and os.path.exists(result["analytics_file"]):
-                    try:
-                        with open(result["analytics_file"], 'r') as f:
-                            analytics_data = json.load(f)
-                        
-                        if isinstance(analytics_data, list) and len(analytics_data) > 0:
-                            # Calculate basic statistics
-                            session_data["total_frames"] = len(analytics_data)
-                            session_data["fps"] = 30.0  # Default FPS
-                            
-                            # Calculate landmark detection rate
-                            frames_with_landmarks = 0
-                            total_confidence = 0.0
-                            
-                            for frame_data in analytics_data:
-                                if isinstance(frame_data, dict) and 'landmarks' in frame_data:
-                                    landmarks = frame_data['landmarks']
-                                    if landmarks and len(landmarks) > 0:
-                                        frames_with_landmarks += 1
-                                        frame_confidence = sum(landmark.get('visibility', 0) for landmark in landmarks) / len(landmarks)
-                                        total_confidence += frame_confidence
-                            
-                            detection_rate = frames_with_landmarks / len(analytics_data) if len(analytics_data) > 0 else 0
-                            avg_confidence = total_confidence / frames_with_landmarks if frames_with_landmarks > 0 else 0
-                            
-                            session_data["landmark_confidence"] = avg_confidence
-                            session_data["motion_iq"] = detection_rate * 100
-                            session_data["precision"] = avg_confidence * 100
-                            
-                            print(f"📊 Analytics calculated: {len(analytics_data)} frames, {detection_rate:.2%} detection rate")
-                    
-                    except Exception as e:
-                        print(f"⚠️  Error calculating analytics: {e}")
-                
-                # Update existing session or create new one
-                existing_session_id = data.get('session_id')
-                if existing_session_id:
-                    # Update existing session with analysis results
-                    print(f"🔄 Updating existing session: {existing_session_id}")
-                    sessions.update_session(existing_session_id, session_data)
-                    session_id = existing_session_id
-                else:
-                    # Create new session (for standalone analysis)
-                    print(f"🆕 Creating new session")
-                    session_id = sessions.create_session(session_data)
-                
-                return jsonify({
-                    "success": True,
-                    "session_id": session_id,
-                    "video_id": str(video_id),
-                    "analytics_id": str(analytics_id) if analytics_id else None,
-                    "output_video": os.path.basename(result.get("h264_video", result["output_video"])),
-                    "analytics_file": os.path.basename(result["analytics_file"]) if result["analytics_file"] else None,
-                    "message": "Video analysis completed and uploaded to MongoDB",
-                    "download_url": f"http://localhost:5004/getVideo?video_filename={result.get('output_video', '')}",
-                    "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}",
-                    "timestamp": datetime.now().isoformat()
-                })
-            else:
-                return jsonify({
-                    "success": False,
-                    "error": "Failed to upload processed video to MongoDB",
-                    "message": "Video was processed but could not be stored in database"
-                }), 500
+        # First, try to find the session to check for Cloudflare Stream or GridFS video ID
+        if session_id:
+            # Use the session we already found
+            session = sessions.get_session(session_id)
         else:
-            return jsonify({
-                "success": False,
-                "error": result["error"],
-                "message": result["message"]
-            }), 500
+            # Fallback to finding by video filename
+            session = sessions.get_session_by_video_filename(video_filename)
         
-    except Exception as e:
-        print(f"❌ Error in analyzeVideo: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "error": "Video analysis failed",
-            "details": str(e)
-        }), 500
-
-# Helper functions (copied from original server)
-def calculate_detailed_statistics(analytics_data):
-    """Calculate detailed statistics from analytics data"""
-    if not analytics_data:
-        return {}
-    
-    try:
-        total_frames = len(analytics_data)
-        if total_frames == 0:
-            return {}
-        
-        # Initialize statistics
-        stats = {
-            "total_frames": total_frames,
-            "landmark_detection": {
-                "frames_with_landmarks": 0,
-                "average_confidence": 0.0,
-                "detection_rate": 0.0
-            },
-            "motion_analysis": {
-                "average_velocity": 0.0,
-                "max_velocity": 0.0,
-                "motion_consistency": 0.0
-            },
-            "pose_analysis": {
-                "average_pose_confidence": 0.0,
-                "stable_poses": 0,
-                "pose_variability": 0.0
-            }
-        }
-        
-        # Calculate landmark detection statistics
-        frames_with_landmarks = 0
-        total_confidence = 0.0
-        
-        for frame_data in analytics_data:
-            if isinstance(frame_data, dict) and 'landmarks' in frame_data:
-                landmarks = frame_data['landmarks']
-                if landmarks and len(landmarks) > 0:
-                    frames_with_landmarks += 1
-                    # Calculate average confidence for this frame
-                    frame_confidence = sum(landmark.get('visibility', 0) for landmark in landmarks) / len(landmarks)
-                    total_confidence += frame_confidence
-        
-        stats["landmark_detection"]["frames_with_landmarks"] = frames_with_landmarks
-        stats["landmark_detection"]["detection_rate"] = frames_with_landmarks / total_frames if total_frames > 0 else 0
-        stats["landmark_detection"]["average_confidence"] = total_confidence / frames_with_landmarks if frames_with_landmarks > 0 else 0
-        
-        return stats
-        
-    except Exception as e:
-        print(f"❌ Error calculating detailed statistics: {e}")
-        return {"error": str(e)}
-
-def calculate_acl_risk_analysis(analytics_data):
-    """Calculate ACL risk analysis from analytics data"""
-    if not analytics_data:
-        return {}
-    
-    try:
-        # Simplified ACL risk calculation
-        total_frames = len(analytics_data)
-        high_risk_frames = 0
-        medium_risk_frames = 0
-        low_risk_frames = 0
-        
-        for frame_data in analytics_data:
-            if isinstance(frame_data, dict) and 'landmarks' in frame_data:
-                landmarks = frame_data['landmarks']
-                if landmarks and len(landmarks) >= 33:  # Full pose landmarks
-                    # Simple risk assessment based on landmark positions
-                    # This is a simplified version - real ACL risk assessment would be more complex
-                    risk_score = 0.0
-                    
-                    # Calculate some basic risk factors
-                    if len(landmarks) > 25:  # Left knee, right knee landmarks
-                        left_knee = landmarks[25] if len(landmarks) > 25 else None
-                        right_knee = landmarks[26] if len(landmarks) > 26 else None
-                        
-                        if left_knee and right_knee:
-                            # Simple risk calculation based on knee positions
-                            knee_angle_factor = abs(left_knee.get('x', 0.5) - right_knee.get('x', 0.5))
-                            risk_score = min(knee_angle_factor * 100, 100)
-                    
-                    # Categorize risk
-                    if risk_score > 70:
-                        high_risk_frames += 1
-                    elif risk_score > 40:
-                        medium_risk_frames += 1
-                    else:
-                        low_risk_frames += 1
-        
-        # Calculate overall risk
-        overall_risk = (high_risk_frames * 0.8 + medium_risk_frames * 0.4 + low_risk_frames * 0.1) / total_frames if total_frames > 0 else 0
-        
-        return {
-            "overall_risk_score": overall_risk * 100,
-            "risk_distribution": {
-                "high_risk_frames": high_risk_frames,
-                "medium_risk_frames": medium_risk_frames,
-                "low_risk_frames": low_risk_frames
-            },
-            "risk_percentage": {
-                "high_risk": (high_risk_frames / total_frames * 100) if total_frames > 0 else 0,
-                "medium_risk": (medium_risk_frames / total_frames * 100) if total_frames > 0 else 0,
-                "low_risk": (low_risk_frames / total_frames * 100) if total_frames > 0 else 0
-            },
-            "recommendations": [
-                "Focus on proper landing mechanics",
-                "Strengthen core stability",
-                "Practice controlled landings"
-            ] if overall_risk > 0.5 else [
-                "Maintain current form",
-                "Continue strength training"
-            ]
-        }
-        
-    except Exception as e:
-        print(f"❌ Error calculating ACL risk analysis: {e}")
-        return {"error": str(e)}
-
-if __name__ == '__main__':
-    print("🚀 Starting Updated Gymnastics API Server with MongoDB Integration...")
-    print("📊 MongoDB Collections:")
-    try:
-        collections = db_manager.db.list_collection_names()
-        for collection in collections:
-            count = db_manager.db[collection].count_documents({})
-            print(f"   {collection}: {count} documents")
-    except Exception as e:
-        print(f"❌ Error checking MongoDB: {e}")
-
-@app.route('/getSessionsByUser/<user_id>', methods=['GET'])
-def get_sessions_by_user(user_id):
-    """Get sessions by user ID (frontend compatibility)"""
-    try:
-        # Get all sessions and filter by user_id
-        all_sessions = sessions.get_all_sessions()
-        user_sessions = [s for s in all_sessions if s.get('user_id') == user_id]
-        
-        # Add GridFS file information and convert ObjectIds to strings
-        for session in user_sessions:
-            # Convert ObjectIds to strings for JSON serialization
-            if session.get('_id'):
-                session['_id'] = str(session['_id'])
-            if session.get('gridfs_video_id'):
-                session['gridfs_video_id'] = str(session['gridfs_video_id'])
-                try:
-                    video_file = fs.get(ObjectId(session['gridfs_video_id']))
-                    session['video_size'] = video_file.length
-                    session['video_upload_date'] = video_file.upload_date.isoformat()
-                except:
-                    session['video_size'] = 0
-                    session['video_upload_date'] = None
-            
-            if session.get('gridfs_analytics_id'):
-                session['gridfs_analytics_id'] = str(session['gridfs_analytics_id'])
-                try:
-                    analytics_file = fs.get(ObjectId(session['gridfs_analytics_id']))
-                    session['analytics_size'] = analytics_file.length
-                    session['analytics_upload_date'] = analytics_file.upload_date.isoformat()
-                except:
-                    session['analytics_size'] = 0
-                    session['analytics_upload_date'] = None
-        
-        return jsonify({
-            "success": True,
-            "sessions": user_sessions,
-            "count": len(user_sessions),
-            "user_id": user_id,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        print(f"❌ Error getting sessions for user {user_id}: {e}")
-        return jsonify({
-            "success": False,
-            "error": f"Failed to retrieve sessions for user {user_id}",
-            "details": str(e)
-        }), 500
-
-@app.route('/downloadPerFrameVideo', methods=['GET'])
-def download_per_frame_video():
-    """Download per-frame video (overlayed) by filename (frontend compatibility)"""
-    try:
-        video_filename = request.args.get('video_filename')
-        if not video_filename:
-            return jsonify({"error": "video_filename parameter is required"}), 400
-        
-        # Find session by video filename
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            return jsonify({"error": "Video not found"}), 404
-        
-        # For now, return the regular processed video
-        # In a real implementation, this would return the per-frame overlay video
-        video_id = session.get('gridfs_video_id')
-        if not video_id:
-            return jsonify({"error": "Video file not found in database"}), 404
-        
-        try:
-            if isinstance(video_id, str):
-                video_id = ObjectId(video_id)
-            
-            grid_out = fs.get(video_id)
-            
-            def generate():
-                while True:
-                    chunk = grid_out.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-            
-            return Response(
-                generate(),
-                mimetype='video/mp4',
-                headers={
-                    'Content-Disposition': f'attachment; filename="per_frame_{video_filename}"',
-                    'Content-Length': str(grid_out.length)
-                }
-            )
-            
-        except Exception as e:
-            print(f"❌ Error streaming per-frame video: {e}")
-            return jsonify({"error": "Failed to stream video"}), 500
-            
-    except Exception as e:
-        print(f"❌ Error downloading per-frame video: {e}")
-        return jsonify({"error": "Failed to download per-frame video"}), 500
-
-
-def analyze_video_from_gridfs_internal(data):
-    """Internal function to analyze video from GridFS (called from uploadVideo)"""
-    try:
-        video_filename = data.get('video_filename')
-        athlete_name = data.get('athlete_name', 'Unknown Athlete')
-        event = data.get('event', 'Floor Exercise')
-        session_name = data.get('session_name', f'{athlete_name} - {event}')
-        user_id = data.get('user_id', 'demo_user')
-        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
-        
-        if not video_filename:
-            return {"success": False, "error": "video_filename is required"}
-        
-        print(f"🔍 Looking for video: {video_filename}")
-        
-        # Check if Railway MediaPipe server is running
-        if not video_processor.check_mediapipe_server():
-            return {
-                "success": False,
-                "error": "Railway MediaPipe server is not available",
-                "message": "Please check the Railway MediaPipe server status",
-                "server_url": MEDIAPIPE_SERVER_URL
-            }
-        
-        # For auto-analysis, prioritize GridFS lookup since video was just uploaded
         video_path = None
-        gridfs_video_id = data.get('gridfs_video_id')
         
-        # First try to use GridFS video ID if provided (for auto-analysis)
-        if gridfs_video_id:
-            print(f"🔍 Using provided GridFS video ID: {gridfs_video_id}")
-            try:
-                from bson import ObjectId
-                gridfs_file = fs.get(ObjectId(gridfs_video_id))
-                print(f"✅ Found video in GridFS by ID: {gridfs_file.filename}")
-                
-                # Download video from GridFS to local temp file
-                # Ensure temp directory exists
-                os.makedirs(TEMP_DIR, exist_ok=True)
-                temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
-                with open(temp_video_path, 'wb') as temp_file:
-                    temp_file.write(gridfs_file.read())
-                
-                video_path = temp_video_path
-                print(f"📥 Downloaded video to: {video_path}")
-            except Exception as gridfs_error:
-                print(f"⚠️ GridFS lookup by ID failed: {gridfs_error}")
-                gridfs_file = None
-        else:
-            # Fallback to filename search
-            print(f"🔍 Searching GridFS for: {video_filename}")
+        if session:
+            # Priority 1: Check for Cloudflare Stream video
+            cloudflare_uid = None
+            if cloudflare_stream_id:
+                # Use the provided Cloudflare Stream ID
+                cloudflare_uid = cloudflare_stream_id
+                print(f"🌊 Using provided Cloudflare Stream ID: {cloudflare_uid}")
+            elif session.get('meta') and session['meta'].get('cloudflare_stream_id'):
+                cloudflare_uid = session['meta']['cloudflare_stream_id']
+            elif session.get('meta') and session['meta'].get('cloudflare_uid'):
+                cloudflare_uid = session['meta']['cloudflare_uid']
             
-            # Search for video in GridFS
-            gridfs_file = None
-            try:
-                # Try to find by exact filename first
-                gridfs_file = fs.find_one({"filename": video_filename})
+            if cloudflare_uid:
+                print(f"🌊 Found session with Cloudflare Stream UID: {cloudflare_uid}")
                 
-                # If not found, try to find by partial match
-                if not gridfs_file:
-                    base_name = os.path.splitext(video_filename)[0]
-                    for file_doc in fs.find({"filename": {"$regex": base_name, "$options": "i"}}):
-                        if file_doc.filename.endswith('.mp4'):
-                            gridfs_file = file_doc
-                            break
+                # Check if video is ready to stream first
+                try:
+                    import requests
+                    headers = {
+                        'Authorization': f'Bearer {CLOUDFLARE_STREAM_TOKEN}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    # Get video details to check if it's ready
+                    video_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_STREAM_ACCOUNT_ID}/stream/{cloudflare_uid}"
+                    response = requests.get(video_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        video_data = response.json()
+                        if video_data.get('success'):
+                            video_info = video_data['result']
+                            ready_to_stream = video_info.get('readyToStream', False)
+                            print(f"🌊 Video ready status: {ready_to_stream}")
+                            
+                            if not ready_to_stream:
+                                return jsonify({
+                                    "error": "Video is still processing. Please wait a few minutes and try again.",
+                                    "message": "Cloudflare Stream is still processing your video. This usually takes 2-5 minutes for videos of this size.",
+                                    "video_ready": False,
+                                    "cloudflare_uid": cloudflare_uid
+                                }), 202  # 202 = Accepted but processing
+                    else:
+                        print(f"⚠️ Could not check video status: {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"⚠️ Error checking video status: {e}")
+                    # Continue with download attempt anyway
                 
-                if gridfs_file:
-                    print(f"✅ Found video in GridFS: {gridfs_file.filename}")
+                try:
+                    # Download video from Cloudflare Stream to local temp file
+                    os.makedirs(TEMP_DIR, exist_ok=True)
+                    temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{video_filename}")
+                    
+                    if download_video_from_cloudflare_stream(cloudflare_uid, temp_video_path):
+                        video_path = temp_video_path
+                        print(f"✅ Downloaded video from Cloudflare Stream to: {video_path}")
+                    else:
+                        print(f"⚠️ Failed to download from Cloudflare Stream, falling back to GridFS")
+                        cloudflare_uid = None  # Reset to try GridFS
+                        
+                except Exception as cloudflare_error:
+                    print(f"⚠️ Cloudflare Stream download failed: {cloudflare_error}")
+                    cloudflare_uid = None  # Reset to try GridFS
+            
+            # Priority 2: Fall back to GridFS if Cloudflare Stream failed or not available
+            if not video_path and session.get('gridfs_video_id'):
+                print(f"🔍 Falling back to GridFS video ID: {session['gridfs_video_id']}")
+                try:
+                    from bson import ObjectId
+                    gridfs_file = fs.get(ObjectId(session['gridfs_video_id']))
+                    print(f"✅ Found video in GridFS by session ID: {gridfs_file.filename}")
                     
                     # Download video from GridFS to local temp file
-                    # Ensure temp directory exists
                     os.makedirs(TEMP_DIR, exist_ok=True)
                     temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
                     with open(temp_video_path, 'wb') as temp_file:
                         temp_file.write(gridfs_file.read())
                     
                     video_path = temp_video_path
-                    print(f"📥 Downloaded video to: {video_path}")
-                else:
-                    print(f"⚠️ Video not found in GridFS, trying local search: {video_filename}")
-                    
-            except Exception as gridfs_error:
-                print(f"⚠️ GridFS search failed: {gridfs_error}")
-        
-        # If GridFS lookup failed, try local search as fallback (but only if no GridFS video ID was provided)
-        if not video_path:
-            if gridfs_video_id:
-                # If we have a GridFS video ID but couldn't download it, that's an error
-                return {
-                    "success": False,
-                    "error": f"Failed to download video from GridFS with ID: {gridfs_video_id}"
-                }
-            else:
-                # Only try local search if no GridFS video ID was provided
-                print(f"🔍 Trying local search for: {video_filename}")
-                best_video_path, is_h264, original_path = video_processor.find_best_video(video_filename)
-                
-                if best_video_path and os.path.exists(best_video_path):
-                    print(f"✅ Found local video: {best_video_path}")
-                    video_path = best_video_path
-                else:
-                    return {
-                        "success": False,
-                        "error": f"Video file not found in GridFS or locally: {video_filename}"
-                    }
-        
-        # Update session status to processing immediately
-        if session:
-            sessions.update_session(session['_id'], {
-                "status": "processing",
-                "processing_status": "analyzing",
-                "notes": f"Analysis started: {video_filename}",
-                "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-            })
-        
-        # Return immediately to prevent timeout, processing will continue in background
-        print(f"🔄 Starting background video processing for: {video_filename}")
-        print(f"📁 Video path: {video_path}")
-        
-        # Start processing in background (this will be handled by the internal function)
-        try:
-            # Call the internal function that handles the actual processing
-            result = analyze_video_from_gridfs_internal({
-                "video_filename": video_filename,
-                "athlete_name": athlete_name,
-                "event": event,
-                "session_name": session_name,
-                "user_id": user_id,
-                "date": date,
-                "session_id": session['_id'] if session else None
-            })
-            
-            # If we get here, processing completed quickly
-            if result.get("success"):
-                print(f"✅ Video analysis completed successfully: {video_filename}")
-                return {
-                    "success": True,
-                    "message": "Video analysis completed successfully",
-                    "session_id": result.get("session_id"),
-                    "video_id": result.get("video_id"),
-                    "analytics_id": result.get("analytics_id"),
-                    "output_video": result.get("output_video"),
-                    "analytics_file": result.get("analytics_file"),
-                    "download_url": result.get("download_url"),
-                    "analytics_url": result.get("analytics_url"),
-                    "timestamp": result.get("timestamp")
-                }
-            else:
-                print(f"❌ Video analysis failed: {result.get('error')}")
-                return {
-                    "success": False,
-                    "error": result.get("error", "Video analysis failed"),
-                    "details": result.get("details", "")
-                }
-                
-        except Exception as processing_error:
-            print(f"❌ Video processing exception: {processing_error}")
-            return {
-                "success": False,
-                "error": "Video processing failed",
-                "details": str(processing_error)
-            }
-            
-    except Exception as e:
-        print(f"❌ Error in analyzeVideo1: {e}")
-        return {
-            "success": False,
-            "error": "Video analysis failed",
-            "details": str(e)
-        }
-
-@app.route('/analyzeVideo1', methods=['POST'])
-def analyze_video_from_gridfs():
-    """Analyze video from GridFS by downloading it locally first, then processing"""
-    try:
-        data = request.get_json()
-        video_filename = data.get('video_filename')
-        athlete_name = data.get('athlete_name', 'Unknown Athlete')
-        event = data.get('event', 'Floor Exercise')
-        session_name = data.get('session_name', f'{athlete_name} - {event}')
-        user_id = data.get('user_id', 'demo_user')
-        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
-        
-        if not video_filename:
-            return jsonify({"error": "video_filename is required"}), 400
-        
-        print(f"🔍 Looking for video: {video_filename}")
-        
-        # Check if Railway MediaPipe server is running
-        if not video_processor.check_mediapipe_server():
-            return jsonify({
-                "error": "Railway MediaPipe server is not available",
-                "message": "Please check the Railway MediaPipe server status",
-                "server_url": MEDIAPIPE_SERVER_URL
-            }), 503
-        
-        # First, try to find the session to get GridFS video ID
-        session = sessions.get_session_by_video_filename(video_filename)
-        video_path = None
-        
-        if session and session.get('gridfs_video_id'):
-            # Use GridFS video ID if available (prioritize uploaded video)
-            print(f"🔍 Found session with GridFS video ID: {session['gridfs_video_id']}")
-            try:
-                from bson import ObjectId
-                gridfs_file = fs.get(ObjectId(session['gridfs_video_id']))
-                print(f"✅ Found video in GridFS by session ID: {gridfs_file.filename}")
-                
-                # Download video from GridFS to local temp file
-                os.makedirs(TEMP_DIR, exist_ok=True)
-                temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
-                with open(temp_video_path, 'wb') as temp_file:
-                    temp_file.write(gridfs_file.read())
-                
-                video_path = temp_video_path
-                print(f"📥 Downloaded original video from GridFS to: {video_path}")
-            except Exception as gridfs_error:
-                print(f"⚠️ GridFS lookup by session ID failed: {gridfs_error}")
-                gridfs_file = None
+                    print(f"📥 Downloaded original video from GridFS to: {video_path}")
+                except Exception as gridfs_error:
+                    print(f"⚠️ GridFS lookup by session ID failed: {gridfs_error}")
+                    gridfs_file = None
         
         if not video_path:
             # Fallback: try to find video in GridFS by filename
@@ -2480,6 +1764,33 @@ def analyze_video_from_gridfs():
         if not video_id:
             return jsonify({"error": "Failed to upload processed video to MongoDB"}), 500
         
+        # Check if original video was from Cloudflare Stream and upload processed video there too
+        cloudflare_processed_video = None
+        processed_video_url = f"http://localhost:5004/getVideo?video_filename={os.path.basename(actual_output_path)}"
+        
+        if session and session.get('meta') and (session['meta'].get('cloudflare_stream_id') or session['meta'].get('cloudflare_uid')):
+            print(f"🌊 Original video was from Cloudflare Stream, uploading processed video...")
+            try:
+                # Upload processed video to Cloudflare Stream
+                processed_metadata = {
+                    "name": f"analyzed_{os.path.basename(actual_output_path)}",
+                    "description": f"Analyzed video for {athlete_name} - {event}",
+                    "athlete_name": athlete_name,
+                    "event": event,
+                    "session_name": session_name,
+                    "analysis_type": "pose_detection",
+                    "processing_timestamp": timestamp
+                }
+                
+                cloudflare_processed_video = upload_to_cloudflare_stream(actual_output_path, processed_metadata)
+                if cloudflare_processed_video:
+                    processed_video_url = get_cloudflare_stream_url(cloudflare_processed_video.get('uid'))
+                    print(f"✅ Processed video uploaded to Cloudflare Stream: {cloudflare_processed_video.get('uid')}")
+                else:
+                    print(f"⚠️ Failed to upload processed video to Cloudflare Stream, using GridFS URL")
+            except Exception as e:
+                print(f"⚠️ Error uploading processed video to Cloudflare Stream: {e}")
+
         # Create session record
         session_data = {
             "user_id": user_id,
@@ -2490,7 +1801,7 @@ def analyze_video_from_gridfs():
             "duration": "00:00",
             "original_filename": video_filename,
             "processed_video_filename": os.path.basename(actual_output_path),
-            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(actual_output_path)}",
+            "processed_video_url": processed_video_url,
             "analytics_filename": analytics_filename if analytics_id else None,
             "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
             "motion_iq": 0.0,
@@ -2516,8 +1827,48 @@ def analyze_video_from_gridfs():
             "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
         }
         
-        session_id = sessions.create_session(session_data)
-        print(f"✅ Session created: {session_id}")
+        # Add Cloudflare Stream metadata if processed video was uploaded there
+        if cloudflare_processed_video:
+            # Preserve original Cloudflare Stream metadata and add analyzed video info
+            original_meta = session.get('meta', {}) if session else {}
+            
+            session_data["meta"] = {
+                # Original video Cloudflare Stream info
+                "cloudflare_stream_id": original_meta.get('cloudflare_stream_id'),
+                "cloudflare_uid": original_meta.get('cloudflare_uid'),
+                "upload_source": original_meta.get('upload_source', 'cloudflare_stream'),
+                "upload_timestamp": original_meta.get('upload_timestamp'),
+                "video_size": original_meta.get('video_size'),
+                "video_duration": original_meta.get('video_duration'),
+                "ready_to_stream": original_meta.get('ready_to_stream', False),
+                "stream_url": original_meta.get('stream_url'),
+                "thumbnail": original_meta.get('thumbnail'),
+                
+                # Analyzed video Cloudflare Stream info
+                "analyzed_cloudflare_stream_id": cloudflare_processed_video.get('uid'),
+                "analyzed_cloudflare_uid": cloudflare_processed_video.get('uid'),
+                "analyzed_upload_timestamp": datetime.now().isoformat(),
+                "analyzed_video_size": cloudflare_processed_video.get('size'),
+                "analyzed_video_duration": cloudflare_processed_video.get('duration'),
+                "analyzed_ready_to_stream": cloudflare_processed_video.get('readyToStream', False),
+                "analyzed_stream_url": processed_video_url,
+                "analyzed_thumbnail": cloudflare_processed_video.get('thumbnail'),
+                "description": f"Analyzed video for {athlete_name} - {event}",
+                "analysis_type": "pose_detection"
+            }
+        
+        # Check if we should update existing session or create new one
+        existing_session_id = None
+        if session and session.get('_id'):
+            existing_session_id = str(session['_id'])
+            print(f"🔄 Updating existing session: {existing_session_id}")
+            sessions.update_session(existing_session_id, session_data)
+            session_id = existing_session_id
+        else:
+            print(f"🆕 Creating new session")
+            session_id = sessions.create_session(session_data)
+        
+        print(f"✅ Session processed: {session_id}")
         
         # Clean up temporary file if it was downloaded from GridFS
         if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
@@ -2527,7 +1878,7 @@ def analyze_video_from_gridfs():
             except Exception as e:
                 print(f"⚠️ Could not clean up temporary file: {e}")
         
-        return jsonify({
+        response_data = {
             "success": True,
             "message": "Video analysis completed and uploaded to MongoDB",
             "session_id": str(session_id),
@@ -2538,7 +1889,21 @@ def analyze_video_from_gridfs():
             "download_url": f"http://localhost:5004/getVideo?video_filename={os.path.basename(actual_output_path)}",
             "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
             "timestamp": datetime.now().isoformat()
-        })
+        }
+        
+        # Add Cloudflare Stream information if processed video was uploaded there
+        if cloudflare_processed_video:
+            response_data["cloudflare_stream"] = {
+                "video_id": cloudflare_processed_video.get('uid'),
+                "stream_url": processed_video_url,
+                "size": cloudflare_processed_video.get('size'),
+                "duration": cloudflare_processed_video.get('duration'),
+                "ready_to_stream": cloudflare_processed_video.get('readyToStream', False),
+                "thumbnail": cloudflare_processed_video.get('thumbnail')
+            }
+            response_data["message"] += " and uploaded to Cloudflare Stream"
+        
+        return jsonify(response_data)
         
     except Exception as e:
         print(f"❌ Error in analyzeVideo1: {e}")
@@ -2547,465 +1912,23 @@ def analyze_video_from_gridfs():
             "details": str(e)
         }), 500
 
-@app.route('/analyzevideo2', methods=['POST'])
-def analyze_video_enhanced():
-    """Analyze video using enhanced overlay script with anti-flickering and comprehensive analytics (ASYNC)"""
-    try:
-        data = request.get_json()
-        video_filename = data.get('video_filename')
-        athlete_name = data.get('athlete_name', 'Unknown Athlete')
-        event = data.get('event', 'Floor Exercise')
-        session_name = data.get('session_name', f'{athlete_name} - {event}')
-        user_id = data.get('user_id', 'demo_user')
-        date = data.get('date', datetime.now().strftime("%Y-%m-%d"))
-        
-        if not video_filename:
-            return jsonify({"error": "video_filename is required"}), 400
-        
-        print(f"🔍 Looking for video: {video_filename}")
-        
-        # Check if Railway MediaPipe server is running
-        if not video_processor.check_mediapipe_server():
-            return jsonify({
-                "error": "Railway MediaPipe server is not available",
-                "message": "Please check the Railway MediaPipe server status",
-                "server_url": MEDIAPIPE_SERVER_URL
-            }), 503
-        
-        # First, try to find the session to get GridFS video ID
-        session = sessions.get_session_by_video_filename(video_filename)
-        video_path = None
-        
-        if session and session.get('gridfs_video_id'):
-            # Use GridFS video ID if available (prioritize uploaded video)
-            print(f"🔍 Found session with GridFS video ID: {session['gridfs_video_id']}")
-            try:
-                from bson import ObjectId
-                gridfs_file = fs.get(ObjectId(session['gridfs_video_id']))
-                print(f"✅ Found video in GridFS by session ID: {gridfs_file.filename}")
-                
-                # Download video from GridFS to local temp file
-                os.makedirs(TEMP_DIR, exist_ok=True)
-                temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
-                with open(temp_video_path, 'wb') as temp_file:
-                    temp_file.write(gridfs_file.read())
-                
-                video_path = temp_video_path
-                print(f"📥 Downloaded original video from GridFS to: {video_path}")
-            except Exception as gridfs_error:
-                print(f"⚠️ GridFS lookup by session ID failed: {gridfs_error}")
-                gridfs_file = None
-        
-        if not video_path:
-            # Fallback: try to find video in GridFS by filename
-            print(f"🔍 No session found, searching GridFS for: {video_filename}")
-            
-            # Search for video in GridFS
-            gridfs_file = None
-            try:
-                # Try to find by exact filename first
-                gridfs_file = fs.find_one({"filename": video_filename})
-                
-                # If not found, try to find by partial match
-                if not gridfs_file:
-                    base_name = os.path.splitext(video_filename)[0]
-                    for file_doc in fs.find({"filename": {"$regex": base_name, "$options": "i"}}):
-                        if file_doc.filename.endswith('.mp4'):
-                            gridfs_file = file_doc
-                            break
-                
-                if gridfs_file:
-                    print(f"✅ Found video in GridFS: {gridfs_file.filename}")
-                
-                    # Download video from GridFS to temporary local file
-                    os.makedirs(TEMP_DIR, exist_ok=True)
-                    temp_video_path = os.path.join(TEMP_DIR, f"temp_{int(time.time())}_{gridfs_file.filename}")
-                    with open(temp_video_path, 'wb') as temp_file:
-                        temp_file.write(gridfs_file.read())
-                    
-                    video_path = temp_video_path
-                    print(f"📥 Downloaded video from GridFS to: {video_path}")
-                    print(f"✅ Video downloaded successfully: {os.path.getsize(temp_video_path)} bytes")
-                
-            except Exception as e:
-                print(f"❌ Error accessing GridFS: {e}")
-                return jsonify({"error": f"Failed to access video in GridFS: {str(e)}"}), 500
-        
-        # Final fallback: if no video found in GridFS, try local search (but warn about it)
-        if not video_path:
-            print(f"⚠️ No video found in GridFS, trying local search as last resort: {video_filename}")
-            best_video_path, is_h264, original_path = video_processor.find_best_video(video_filename)
-            
-            if best_video_path and os.path.exists(best_video_path):
-                print(f"⚠️ Found local video (this may be a processed video): {best_video_path}")
-                video_path = best_video_path
-            else:
-                return jsonify({"error": f"Video file not found in GridFS or locally: {video_filename}"}), 404
-        
-        # Generate unique output name and job ID
-        timestamp = int(time.time())
-        base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_name = f"enhanced_analyzed_temp_{timestamp}_{base_name}_{timestamp}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_name)
-        job_id = f"enhanced_analysis_{timestamp}_{base_name}"
-        
-        # Ensure output directory exists
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        
-        # Create a session record immediately with processing status
-        session_data = {
-            "user_id": user_id,
-            "athlete_name": athlete_name,
-            "session_name": session_name,
-            "event": event,
-            "date": date,
-            "duration": "00:00",
-            "original_filename": video_filename,
-            "processed_video_filename": output_name,
-            "processed_video_url": f"http://localhost:5004/getVideo?video_filename={output_name}",
-            "analytics_filename": None,
-            "analytics_url": None,
-            "motion_iq": 0.0,
-            "acl_risk": 0.0,
-            "precision": 0.0,
-            "power": 0.0,
-            "tumbling_percentage": 0.0,
-            "landmark_confidence": 0.0,
-            "total_frames": 0,
-            "fps": 0.0,
-            "highlights": [],
-            "areas_for_improvement": [],
-            "coach_notes": "",
-            "notes": f"Video analysis started with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
-            "status": "processing",
-            "processing_progress": 0.0,
-            "processing_status": "analyzing",
-            "gridfs_video_id": None,
-            "gridfs_analytics_id": None,
-            "is_binary_stored": False,
-            "has_landmarks": False,
-            "enhanced_analytics": True,
-            "job_id": job_id,
-            "created_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT"),
-            "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-        }
-        
-        session_id = sessions.create_session(session_data)
-        print(f"✅ Created processing session: {session_id} with job_id: {job_id}")
-        
-        # Start background processing
-        def process_video_background():
-            try:
-                print(f"🎬 Starting background processing for: {os.path.basename(video_path)}")
-                
-                # Import and use the enhanced overlay script
-                from fixed_video_overlay_with_analytics_enhanced import FixedVideoOverlayWithAnalytics
-                
-                # Create enhanced overlay processor
-                enhanced_processor = FixedVideoOverlayWithAnalytics(video_path, output_path)
-                
-                # Process video with enhanced analytics
-                print(f"🔄 Processing video with enhanced analytics...")
-                enhanced_processor.process_video()
-                
-                # Check if processing was successful
-                if not os.path.exists(output_path):
-                    print(f"❌ Enhanced video processing failed: {output_path}")
-                    sessions.update_session(session_id, {
-                        "status": "failed",
-                        "processing_status": "failed",
-                        "notes": f"Enhanced video processing failed: {video_filename}",
-                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-                    })
-                    return
-                
-                print(f"✅ Enhanced video processing completed: {output_path}")
-                
-                # Find the analytics file
-                original_filename = os.path.basename(video_path)
-                if original_filename.startswith("temp_"):
-                    original_filename = original_filename.split("_", 2)[2] if "_" in original_filename else original_filename
-                
-                analytics_filename = f"fixed_analytics_{original_filename}.json"
-                analytics_path = os.path.join(".", analytics_filename)
-                
-                if not os.path.exists(analytics_path):
-                    analytics_path = os.path.join(OUTPUT_DIR, analytics_filename)
-                
-                if not os.path.exists(analytics_path):
-                    temp_analytics_filename = f"fixed_analytics_{os.path.basename(video_path)}.json"
-                    temp_analytics_path = os.path.join(".", temp_analytics_filename)
-                    if os.path.exists(temp_analytics_path):
-                        analytics_path = temp_analytics_path
-                        analytics_filename = temp_analytics_filename
-                
-                # Upload processed video and analytics to GridFS
-                print(f"📤 Uploading enhanced processed video and analytics to GridFS...")
-                video_id, analytics_id = video_processor.upload_processed_video_to_gridfs(
-                    output_path, analytics_path, {
-                        "athlete_name": athlete_name,
-                        "event": event,
-                        "session_name": session_name,
-                        "user_id": user_id,
-                        "date": date,
-                        "original_filename": video_filename,
-                        "processed_video_filename": output_name,
-                        "processing_timestamp": timestamp,
-                        "enhanced_analytics": True,
-                        "job_id": job_id
-                    }
-                )
-                
-                if video_id:
-                    # Update session with results
-                    sessions.update_session(session_id, {
-                        "status": "completed",
-                        "processing_status": "completed",
-                        "processing_progress": 100.0,
-                        "gridfs_video_id": video_id,
-                        "gridfs_analytics_id": analytics_id,
-                        "analytics_filename": analytics_filename if analytics_id else None,
-                        "analytics_url": f"http://localhost:5004/getAnalytics/{analytics_id}" if analytics_id else None,
-                        "is_binary_stored": True,
-                        "has_landmarks": True,
-                        "notes": f"Video analyzed with ENHANCED analytics (anti-flickering, comprehensive metrics): {video_filename}",
-                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-                    })
-                    print(f"✅ Session updated with results: {session_id}")
-                else:
-                    print(f"❌ Failed to upload to GridFS for session: {session_id}")
-                    sessions.update_session(session_id, {
-                        "status": "failed",
-                        "processing_status": "failed",
-                        "notes": f"Failed to upload processed video to GridFS: {video_filename}",
-                        "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-                    })
-                
-                # Clean up temporary file
-                if video_path.startswith("/tmp") or video_path.startswith(".") and "temp_" in video_path:
-                    try:
-                        os.remove(video_path)
-                        print(f"🗑️ Cleaned up temporary file: {video_path}")
-                    except Exception as e:
-                        print(f"⚠️ Could not clean up temporary file: {e}")
-                
-            except Exception as e:
-                print(f"❌ Background processing error: {e}")
-                sessions.update_session(session_id, {
-                    "status": "failed",
-                    "processing_status": "failed",
-                    "notes": f"Background processing failed: {str(e)}",
-                    "updated_at": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-                })
-        
-        # Start background processing in a separate thread
-        import threading
-        background_thread = threading.Thread(target=process_video_background)
-        background_thread.daemon = True
-        background_thread.start()
-        
-        print(f"🚀 Background processing started for job: {job_id}")
-        
-        # Return immediately with job information
-        return jsonify({
-            "success": True,
-            "message": "Enhanced video analysis started in background",
-            "session_id": str(session_id),
-            "job_id": job_id,
-            "output_video": output_name,
-            "status": "processing",
-            "enhanced_analytics": True,
-            "features": [
-                "Anti-flickering pose overlay",
-                "Temporal pose smoothing", 
-                "Comprehensive ACL risk assessment",
-                "Enhanced knee valgus calculation",
-                "Landing mechanics analysis",
-                "Every frame processing",
-                "Real-time analytics overlay"
-            ],
-            "timestamp": datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        print(f"❌ Error in analyzevideo2: {e}")
-        return jsonify({
-            "error": "Enhanced video analysis failed",
-            "details": str(e)
-        }), 500
-
-def convert_video_to_h264_for_browser(video_path, output_path):
-    """Convert video to H.264 format for browser compatibility"""
-    try:
-        import subprocess
-        import os
-        
-        # Check if output already exists
-        if os.path.exists(output_path):
-            return True
-            
-        # Convert to H.264 using ffmpeg
-        cmd = [
-            'ffmpeg', '-i', video_path,
-            '-c:v', 'libx264',  # Use H.264 codec
-            '-preset', 'fast',   # Fast encoding
-            '-crf', '23',        # Good quality
-            '-c:a', 'aac',       # Audio codec
-            '-movflags', '+faststart',  # Optimize for streaming
-            '-y',                # Overwrite output file
-            output_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print(f"✅ Video converted to H.264: {output_path}")
-            return True
-        else:
-            print(f"⚠️ H.264 conversion failed: {result.stderr}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error converting video to H.264: {e}")
-        return False
-
-@app.route('/getVideo', methods=['GET', 'HEAD'])
-def get_video_for_frontend():
-    """Get video for frontend display (converted to browser-compatible format)"""
-    try:
-        video_filename = request.args.get('video_filename')
-        if not video_filename:
-            return jsonify({"error": "video_filename parameter is required"}), 400
-        
-        # Find session by video filename
-        session = sessions.get_session_by_video_filename(video_filename)
-        if not session:
-            return jsonify({"error": "Video not found"}), 404
-        
-        video_id = session.get('gridfs_video_id')
-        if not video_id:
-            return jsonify({"error": "Video not found in session"}), 404
-        
-        # Get video file info first
-        video_info = video_processor.get_video_info_from_gridfs(video_id)
-        if not video_info:
-            return jsonify({"error": "Failed to retrieve video info from database"}), 500
-        
-        filename = video_info['filename'] or video_filename
-        file_size = video_info['length']
-        
-        # For HEAD requests, just return headers without video data
-        if request.method == 'HEAD':
-            response = Response(
-                status=200,
-                mimetype='video/mp4',
-                headers={
-                    'Content-Length': str(file_size),
-                    'Content-Disposition': f'inline; filename="{filename}"',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                    'Cache-Control': 'public, max-age=3600'
-                }
-            )
-            return response
-        
-        # Download video from GridFS to temporary file
-        temp_video_path = os.path.join('/tmp', f"temp_{int(time.time())}_{filename}")
-        try:
-            with open(temp_video_path, 'wb') as temp_file:
-                for chunk in video_processor.stream_video_from_gridfs(video_id, 0, file_size - 1)[0]:
-                    temp_file.write(chunk)
-            
-            # Check if video is already H.264 (avoid double conversion)
-            video_filename = os.path.basename(temp_video_path)
-            is_already_h264 = 'h264' in video_filename.lower() or video_filename.startswith('h264_')
-            
-            if is_already_h264:
-                # Video is already H.264, serve directly
-                print(f"✅ Video is already H.264, serving directly: {video_filename}")
-                with open(temp_video_path, 'rb') as video_file:
-                    video_data = video_file.read()
-                
-                # Clean up temporary file
-                os.remove(temp_video_path)
-            else:
-                # Convert to H.264 for browser compatibility
-                h264_video_path = temp_video_path.replace('.mp4', '_h264.mp4')
-                
-                if convert_video_to_h264_for_browser(temp_video_path, h264_video_path):
-                    # Serve the H.264 converted video
-                    with open(h264_video_path, 'rb') as h264_file:
-                        video_data = h264_file.read()
-                    
-                    # Clean up temporary files
-                    os.remove(temp_video_path)
-                    os.remove(h264_video_path)
-                else:
-                    # H.264 conversion failed, serve original video
-                    with open(temp_video_path, 'rb') as video_file:
-                        video_data = video_file.read()
-                    
-                    # Clean up temporary file
-                    os.remove(temp_video_path)
-                
-                response = Response(
-                    video_data,
-                    status=200,
-                    mimetype='video/mp4',
-                    headers={
-                        'Content-Length': str(len(video_data)),
-                        'Content-Disposition': f'inline; filename="{filename}"',
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                        'Access-Control-Allow-Headers': 'Content-Type',
-                        'Cache-Control': 'public, max-age=3600'
-                    }
-                )
-                
-                return response
-            
-            # Create response for already H.264 videos
-            response = Response(
-                video_data,
-                status=200,
-                mimetype='video/mp4',
-                headers={
-                    'Content-Length': str(len(video_data)),
-                    'Content-Disposition': f'inline; filename="{filename}"',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                    'Cache-Control': 'public, max-age=3600'
-                }
-            )
-            
-            return response
-                
-        except Exception as e:
-            print(f"❌ Error processing video for browser: {e}")
-            return jsonify({"error": "Failed to process video for browser"}), 500
-        
-    except Exception as e:
-        print(f"❌ Error getting video for frontend: {e}")
-        return jsonify({
-            "error": "Failed to get video",
-            "details": str(e)
-        }), 500
-
 if __name__ == '__main__':
-    print("🚀 Starting Gymnastics API Server (Updated with Railway MediaPipe)")
-    print("=" * 60)
+    print("🚀 Starting Gymnastics API Server with Cloudflare Stream Integration")
+    print(f"🌊 Cloudflare Stream Account ID: {CLOUDFLARE_ACCOUNT_ID}")
+    print(f"🌊 Cloudflare Stream Domain: {CLOUDFLARE_STREAM_DOMAIN}")
+    print(f"📊 MongoDB Database: {db_manager.db.name}")
+    print(f"🔧 Max Workers: {MAX_WORKERS}")
+    print(f"💾 Memory Threshold: {MEMORY_THRESHOLD}%")
     
-    # Check MongoDB connection
+    # Test Cloudflare Stream connection
     try:
-        collections = db_manager.db.list_collection_names()
-        print(f"✅ Connected to MongoDB. Collections: {len(collections)}")
-        for collection in collections:
-            count = db_manager.db[collection].count_documents({})
-            print(f"   {collection}: {count} documents")
+        headers = {'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'}
+        response = requests.get(f"{CLOUDFLARE_STREAM_BASE_URL}?limit=1", headers=headers, timeout=10)
+        if response.status_code == 200:
+            print("✅ Cloudflare Stream connection successful")
+        else:
+            print(f"⚠️ Cloudflare Stream connection issue: {response.status_code}")
     except Exception as e:
-        print(f"❌ Error checking MongoDB: {e}")
+        print(f"⚠️ Cloudflare Stream connection error: {e}")
     
-    print("🌐 Server will be available at: http://localhost:5004")
-    app.run(host='0.0.0.0', port=5004, debug=True)
+    app.run(host='0.0.0.0', port=5004, debug=False, threaded=True)
