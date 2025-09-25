@@ -60,7 +60,7 @@ def convert_objectids_to_strings(obj):
 app = Flask(__name__)
 app.json_encoder = JSONEncoder
 CORS(app, 
-     origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app", "https://www.motionlabsai.com"], 
+     origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8000", "http://localhost:8080", "https://motionlabsai-qb7r-5ljq6f0oj-hemchandeishagmailcoms-projects.vercel.app", "https://www.motionlabsai.com","https://motionlabsai-qb7r-9n46w958x-hemchandeishagmailcoms-projects.vercel.app"], 
      allow_headers=["Content-Type", "Authorization", "Range", "X-Requested-With", "Accept", "Origin"],
      expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
