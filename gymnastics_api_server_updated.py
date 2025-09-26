@@ -165,7 +165,7 @@ class MongoDBVideoProcessor:
         
         # Command to run the fixed video overlay script
         cmd = [
-            "python3", "fixed_video_overlay_with_analytics_enhanced.py",  # Changed from "video_overlay_with_analytics_fixed.py",
+            "python3", "video_overlay_with_analytics_fixed.py",  # Changed from "video_overlay_with_analytics_fixed.py",
             video_path,
             "--output", output_path,
             "--server", MEDIAPIPE_SERVER_URL
